@@ -17,6 +17,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname } from "node:path";
 import type {
 	Agent,
+	AgentContext,
 	AgentEvent,
 	AgentMessage,
 	AgentState,
@@ -281,6 +282,11 @@ interface ToolDefinitionEntry {
 	sourceInfo: SourceInfo;
 }
 
+interface AutoCompactionOptions {
+	failClosed?: boolean;
+	parentSignal?: AbortSignal;
+}
+
 function estimateMessagesTokens(messages: AgentMessage[]): number {
 	let tokens = 0;
 	for (const message of messages) {
@@ -325,6 +331,7 @@ export class AgentSession {
 	private _compactionAbortController: AbortController | undefined = undefined;
 	private _autoCompactionAbortController: AbortController | undefined = undefined;
 	private _overflowRecoveryAttempted = false;
+	private _nextTurnCompactionFailed = false;
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
@@ -524,8 +531,17 @@ export class AgentSession {
 				? async (_turn: PrepareNextTurnContext, signal?: AbortSignal) => await this.agent.prepareNextTurn?.(signal)
 				: undefined);
 		this.agent.prepareNextTurnWithContext = async (turn, signal) => {
-			const previousSnapshot = await previousPrepareNextTurnWithContext?.(turn, signal);
-			const previousContext = previousSnapshot?.context ?? turn.context;
+			const refreshedContext = {
+				...turn.context,
+				systemPrompt: this._systemPromptOverride ?? this._baseSystemPrompt,
+				tools: this.agent.state.tools.slice(),
+			};
+			const compactedContext = await this._compactBeforeNextTurn(turn, refreshedContext, signal);
+			const previousSnapshot = await previousPrepareNextTurnWithContext?.(
+				{ ...turn, context: compactedContext },
+				signal,
+			);
+			const previousContext = previousSnapshot?.context ?? compactedContext;
 
 			return {
 				...previousSnapshot,
@@ -666,6 +682,9 @@ export class AgentSession {
 	};
 
 	private _willRetryAfterAgentEnd(event: Extract<AgentEvent, { type: "agent_end" }>): boolean {
+		if (this._nextTurnCompactionFailed) {
+			return false;
+		}
 		const settings = this.settingsManager.getRetrySettings();
 		if (!settings.enabled || this._retryAttempt >= settings.maxRetries) {
 			return false;
@@ -1059,6 +1078,7 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		this._nextTurnCompactionFailed = false;
 		this._isAgentRunActive = true;
 		try {
 			await this.agent.prompt(messages);
@@ -1075,6 +1095,10 @@ export class AgentSession {
 	private async _handlePostAgentRun(): Promise<boolean> {
 		const msg = this._lastAssistantMessage;
 		this._lastAssistantMessage = undefined;
+		if (this._nextTurnCompactionFailed) {
+			this._nextTurnCompactionFailed = false;
+			return false;
+		}
 		if (!msg) {
 			return false;
 		}
@@ -1775,6 +1799,72 @@ export class AgentSession {
 	// Compaction
 	// =========================================================================
 
+	private _estimateNextTurnTokens(context: AgentContext, model: Model<any>): number {
+		const estimate = estimateContextTokens(context.messages);
+		const usageMessage = estimate.lastUsageIndex === null ? undefined : context.messages[estimate.lastUsageIndex];
+		const latestCompaction = getLatestCompactionEntry(this.sessionManager.getBranch());
+		const hasCurrentModelUsage =
+			usageMessage?.role === "assistant" &&
+			usageMessage.provider === model.provider &&
+			usageMessage.model === model.id &&
+			(!latestCompaction || usageMessage.timestamp > new Date(latestCompaction.timestamp).getTime());
+		const toolChars = JSON.stringify(context.tools ?? []).length;
+		const fullEstimate =
+			estimateMessagesTokens(context.messages) + Math.ceil((context.systemPrompt.length + toolChars) / 4);
+		// Prefer the larger estimate: unnecessary compaction is safer than dispatching an oversized turn.
+		return hasCurrentModelUsage ? Math.max(estimate.tokens, fullEstimate) : fullEstimate;
+	}
+
+	private async _compactBeforeNextTurn(
+		turn: PrepareNextTurnContext,
+		context: AgentContext,
+		signal?: AbortSignal,
+	): Promise<AgentContext> {
+		if (turn.toolResults.length === 0) {
+			return context;
+		}
+
+		const model = this.model;
+		const settings = this.settingsManager.getCompactionSettings();
+		if (!model || model.contextWindow <= 0 || !settings.enabled) {
+			return context;
+		}
+
+		const contextTokens = this._estimateNextTurnTokens(context, model);
+		if (!shouldCompact(contextTokens, model.contextWindow, settings)) {
+			return context;
+		}
+
+		try {
+			const reason = contextTokens > model.contextWindow ? "overflow" : "threshold";
+			const compacted = await this._runAutoCompaction(reason, false, {
+				failClosed: true,
+				parentSignal: signal,
+			});
+			signal?.throwIfAborted();
+			if (!compacted) {
+				throw new Error("Compaction did not produce a safe next-turn context.");
+			}
+
+			const compactedContext = {
+				...context,
+				// _runAutoCompaction rebuilt Agent state. Keep the loop array distinct because
+				// queued-message events update Agent state before the loop appends the same messages.
+				messages: this.agent.state.messages.slice(),
+			};
+			const compactedTokens = this._estimateNextTurnTokens(compactedContext, model);
+			if (shouldCompact(compactedTokens, model.contextWindow, settings)) {
+				throw new Error(
+					`Context still exceeds the next-turn budget after compaction (${compactedTokens} > ${model.contextWindow - settings.reserveTokens} tokens).`,
+				);
+			}
+			return compactedContext;
+		} catch (error) {
+			this._nextTurnCompactionFailed = true;
+			throw error;
+		}
+	}
+
 	/**
 	 * Manually compact the session context.
 	 * Aborts current agent operation first.
@@ -2044,33 +2134,52 @@ export class AgentSession {
 	/**
 	 * Internal: Run auto-compaction with events.
 	 */
-	private async _runAutoCompaction(reason: "overflow" | "threshold", willRetry: boolean): Promise<boolean> {
+	private async _runAutoCompaction(
+		reason: "overflow" | "threshold",
+		willRetry: boolean,
+		options: AutoCompactionOptions = {},
+	): Promise<boolean> {
+		const model = this.model;
 		const settings = this.settingsManager.getCompactionSettings();
+		if (this._autoCompactionAbortController) {
+			if (options.failClosed) throw new Error("Automatic compaction is already in progress.");
+			return false;
+		}
 		let started = false;
+		let ended = false;
+		this._autoCompactionAbortController = new AbortController();
+		const compactionSignal = options.parentSignal
+			? AbortSignal.any([this._autoCompactionAbortController.signal, options.parentSignal])
+			: this._autoCompactionAbortController.signal;
 
 		try {
-			if (!this.model) {
+			if (!model) {
+				if (options.failClosed) throw new Error(formatNoModelSelectedMessage());
 				return false;
+			}
+			if (compactionSignal.aborted) {
+				throw compactionSignal.reason instanceof Error
+					? compactionSignal.reason
+					: new Error("Compaction cancelled");
 			}
 
 			let apiKey: string | undefined;
 			let headers: Record<string, string> | undefined;
 			let env: Record<string, string> | undefined;
 			if (this.agent.streamFunction === streamSimple) {
-				({ apiKey, headers, env } = await this._getRequiredRequestAuth(this.model));
+				({ apiKey, headers, env } = await this._getRequiredRequestAuth(model));
 			} else {
-				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(this.model));
+				({ apiKey, headers, env } = await this._getSummarizationRequestAuth(model));
 			}
 
 			const pathEntries = this.sessionManager.getBranch();
-
 			const preparation = prepareCompaction(pathEntries, settings);
 			if (!preparation) {
+				if (options.failClosed) throw new Error("Context exceeds the provider budget but cannot be compacted.");
 				return false;
 			}
 
 			this._emit({ type: "compaction_start", reason });
-			this._autoCompactionAbortController = new AbortController();
 			started = true;
 
 			let extensionCompaction: CompactionResult | undefined;
@@ -2084,7 +2193,7 @@ export class AgentSession {
 					customInstructions: undefined,
 					reason,
 					willRetry,
-					signal: this._autoCompactionAbortController.signal,
+					signal: compactionSignal,
 				})) as SessionBeforeCompactResult | undefined;
 
 				if (extensionResult?.cancel) {
@@ -2095,6 +2204,10 @@ export class AgentSession {
 						aborted: true,
 						willRetry: false,
 					});
+					ended = true;
+					if (options.failClosed) {
+						throw new Error("Compaction cancelled before the next turn");
+					}
 					return false;
 				}
 
@@ -2104,6 +2217,23 @@ export class AgentSession {
 				}
 			}
 
+			if (compactionSignal.aborted) {
+				this._emit({
+					type: "compaction_end",
+					reason,
+					result: undefined,
+					aborted: true,
+					willRetry: false,
+				});
+				ended = true;
+				if (options.failClosed) {
+					throw compactionSignal.reason instanceof Error
+						? compactionSignal.reason
+						: new Error("Compaction cancelled");
+				}
+				return false;
+			}
+
 			let summary: string;
 			let firstKeptEntryId: string;
 			let tokensBefore: number;
@@ -2111,21 +2241,19 @@ export class AgentSession {
 			let details: unknown;
 
 			if (extensionCompaction) {
-				// Extension provided compaction content
 				summary = extensionCompaction.summary;
 				firstKeptEntryId = extensionCompaction.firstKeptEntryId;
 				tokensBefore = extensionCompaction.tokensBefore;
 				usage = extensionCompaction.usage;
 				details = extensionCompaction.details;
 			} else {
-				// Generate compaction result
 				const compactResult = await compact(
 					preparation,
-					this.model,
+					model,
 					apiKey,
 					headers,
 					undefined,
-					this._autoCompactionAbortController.signal,
+					compactionSignal,
 					this.thinkingLevel,
 					this.agent.streamFunction,
 					env,
@@ -2139,7 +2267,7 @@ export class AgentSession {
 				details = compactResult.details;
 			}
 
-			if (this._autoCompactionAbortController.signal.aborted) {
+			if (compactionSignal.aborted) {
 				this._emit({
 					type: "compaction_end",
 					reason,
@@ -2147,6 +2275,12 @@ export class AgentSession {
 					aborted: true,
 					willRetry: false,
 				});
+				ended = true;
+				if (options.failClosed) {
+					throw compactionSignal.reason instanceof Error
+						? compactionSignal.reason
+						: new Error("Compaction cancelled");
+				}
 				return false;
 			}
 
@@ -2156,7 +2290,6 @@ export class AgentSession {
 			this.agent.state.messages = sessionContext.messages;
 			const estimatedTokensAfter = estimateMessagesTokens(sessionContext.messages);
 
-			// Get the saved compaction entry for the extension event
 			const savedCompactionEntry = newEntries.find((e) => e.type === "compaction" && e.summary === summary) as
 				| CompactionEntry
 				| undefined;
@@ -2180,6 +2313,7 @@ export class AgentSession {
 				details,
 			};
 			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			ended = true;
 
 			if (willRetry) {
 				const messages = this.agent.state.messages;
@@ -2189,24 +2323,30 @@ export class AgentSession {
 				}
 				return true;
 			}
+			if (options.failClosed) {
+				return true;
+			}
 
-			// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
-			// Continue once so queued messages are delivered.
 			return this.agent.hasQueuedMessages();
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";
-			if (started) {
+			const aborted = compactionSignal.aborted;
+			if (started && !ended) {
 				this._emit({
 					type: "compaction_end",
 					reason,
 					result: undefined,
-					aborted: false,
+					aborted,
 					willRetry: false,
-					errorMessage:
-						reason === "overflow"
+					errorMessage: aborted
+						? undefined
+						: reason === "overflow"
 							? `Context overflow recovery failed: ${errorMessage}`
 							: `Auto-compaction failed: ${errorMessage}`,
 				});
+			}
+			if (options.failClosed) {
+				throw error;
 			}
 			return false;
 		} finally {

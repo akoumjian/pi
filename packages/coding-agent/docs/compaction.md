@@ -34,6 +34,10 @@ contextTokens > contextWindow - reserveTokens
 
 By default, `reserveTokens` is 16384 tokens (configurable in `~/.pi/agent/settings.json` or `<project-dir>/.pi/settings.json`). This leaves room for the LLM's response.
 
+On tool-producing turns, the coding agent checks this threshold from `prepareNextTurn`, after the assistant message and tool results have been persisted but before the next assistant request. If compaction is needed, Pi completes the normal durable compaction transaction, rebuilds the live context, and resumes the same agent loop. A `session_before_compact` extension can provide the summary at this point; chunking extensions can therefore summarize source histories that are already larger than the summarization model's context window while Pi retains ownership of cut-point preparation, session persistence, and the rebuilt context.
+
+If next-turn compaction is cancelled, fails, or still leaves the rebuilt context above the configured budget, Pi stops that loop before sending another provider request. The existing post-run threshold check remains responsible for turns that end without tool results.
+
 You can also trigger manually with `/compact [instructions]`, where optional instructions focus the summary.
 
 ### How It Works
