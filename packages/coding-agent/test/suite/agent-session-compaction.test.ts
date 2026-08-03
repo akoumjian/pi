@@ -213,7 +213,7 @@ describe("AgentSession compaction characterization", () => {
 		let summarizedTokensBefore = 0;
 		const harness = await createHarness({
 			models: [{ id: "faux-1", contextWindow: 5_000, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, keepRecentTokens: 2_000, reserveTokens: 100 } },
+			settings: { compaction: { enabled: true, keepRecentTokens: 100, reserveTokens: 100 } },
 			tools: [tool],
 			initialActiveToolNames: [tool.name],
 			extensionFactories: [
@@ -234,7 +234,7 @@ describe("AgentSession compaction characterization", () => {
 		});
 		harnesses.push(harness);
 		seedCompactableSession(harness);
-		harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 2_000 } });
+		harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 100 } });
 
 		const toolUse = createAssistant(harness, { stopReason: "toolUse", totalTokens: 4_950 });
 		toolUse.content = [{ type: "toolCall", id: "large-1", name: tool.name, arguments: { text: "result" } }];

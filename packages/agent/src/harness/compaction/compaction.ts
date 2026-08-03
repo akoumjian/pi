@@ -401,11 +401,12 @@ export function findCutPoint(
 		const messageTokens = estimateTokens(entry.message as AgentMessage);
 		accumulatedTokens += messageTokens;
 		if (accumulatedTokens >= keepRecentTokens) {
-			for (let c = 0; c < cutPoints.length; c++) {
-				if (cutPoints[c] >= i) {
-					cutIndex = cutPoints[c];
-					break;
-				}
+			// Prefer the closest valid cut point at or after this entry. If the
+			// newest oversized entry is a tool result, keep its preceding assistant
+			// tool call so the pair remains valid and older context can be summarized.
+			for (const candidate of cutPoints) {
+				cutIndex = candidate;
+				if (candidate >= i) break;
 			}
 			break;
 		}
