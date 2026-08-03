@@ -678,6 +678,296 @@ describe("agentLoop with AgentMessage", () => {
 		expect(turnToolResultIds).toEqual(["tool-1", "tool-2"]);
 	});
 
+	it("should not start prepared parallel tools after a later preflight aborts", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const controller = new AbortController();
+		const executed: string[] = [];
+		const afterToolCalls: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "parallel",
+			beforeToolCall: async ({ args }) => {
+				if ((args as { value: string }).value === "second") {
+					controller.abort();
+				}
+				return undefined;
+			},
+			afterToolCall: async ({ args }) => {
+				afterToolCalls.push((args as { value: string }).value);
+				return undefined;
+			},
+		};
+
+		let llmCalls = 0;
+		const stream = agentLoop([createUserMessage("echo both")], context, config, controller.signal, () => {
+			const call = llmCalls++;
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (call === 0) {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+							{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+						],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+					return;
+				}
+				mockStream.push({
+					type: "error",
+					reason: "aborted",
+					error: createAssistantMessage([], "aborted"),
+				});
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const toolExecutionEndIds = events.flatMap((event) =>
+			event.type === "tool_execution_end" ? [event.toolCallId] : [],
+		);
+		const toolUpdates = events.filter((event) => event.type === "tool_execution_update");
+		const toolResults = events.flatMap((event) => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") {
+				return [];
+			}
+			const text = event.message.content.find((content) => content.type === "text");
+			return [
+				{
+					id: event.message.toolCallId,
+					text: text?.type === "text" ? text.text : "",
+					isError: event.message.isError,
+				},
+			];
+		});
+
+		expect(executed).toEqual([]);
+		expect(afterToolCalls).toEqual([]);
+		expect(llmCalls).toBe(2);
+		expect(toolExecutionEndIds).toEqual(["tool-2", "tool-1"]);
+		expect(toolUpdates).toEqual([]);
+		expect(toolResults).toEqual([
+			{ id: "tool-1", text: "Operation aborted", isError: true },
+			{ id: "tool-2", text: "Operation aborted", isError: true },
+		]);
+	});
+
+	it("should preserve results for parallel tools that started before abort", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const controller = new AbortController();
+		const executed: string[] = [];
+		const afterToolCalls: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				if (params.value === "first") {
+					controller.abort();
+				}
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "parallel",
+			afterToolCall: async ({ args }) => {
+				afterToolCalls.push((args as { value: string }).value);
+				return undefined;
+			},
+		};
+
+		let llmCalls = 0;
+		const stream = agentLoop([createUserMessage("echo both")], context, config, controller.signal, () => {
+			const call = llmCalls++;
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (call === 0) {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+							{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+						],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+					return;
+				}
+				mockStream.push({
+					type: "error",
+					reason: "aborted",
+					error: createAssistantMessage([], "aborted"),
+				});
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const toolExecutionEndIds = events.flatMap((event) =>
+			event.type === "tool_execution_end" ? [event.toolCallId] : [],
+		);
+		const toolResults = events.flatMap((event) => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") {
+				return [];
+			}
+			const text = event.message.content.find((content) => content.type === "text");
+			return [
+				{
+					id: event.message.toolCallId,
+					text: text?.type === "text" ? text.text : "",
+					isError: event.message.isError,
+				},
+			];
+		});
+
+		expect(executed).toEqual(["first"]);
+		expect(afterToolCalls).toEqual(["first"]);
+		expect(llmCalls).toBe(2);
+		expect(toolExecutionEndIds).toEqual(["tool-2", "tool-1"]);
+		expect(toolResults).toEqual([
+			{ id: "tool-1", text: "echoed: first", isError: false },
+			{ id: "tool-2", text: "Operation aborted", isError: true },
+		]);
+	});
+
+	it("should preserve completed sequential tools when a later preflight aborts", async () => {
+		const toolSchema = Type.Object({ value: Type.String() });
+		const controller = new AbortController();
+		const executed: string[] = [];
+		const afterToolCalls: string[] = [];
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				executed.push(params.value);
+				return {
+					content: [{ type: "text", text: `echoed: ${params.value}` }],
+					details: { value: params.value },
+				};
+			},
+		};
+
+		const context: AgentContext = {
+			systemPrompt: "",
+			messages: [],
+			tools: [tool],
+		};
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			toolExecution: "sequential",
+			beforeToolCall: async ({ args }) => {
+				if ((args as { value: string }).value === "second") {
+					controller.abort();
+				}
+				return undefined;
+			},
+			afterToolCall: async ({ args }) => {
+				afterToolCalls.push((args as { value: string }).value);
+				return undefined;
+			},
+		};
+
+		let llmCalls = 0;
+		const stream = agentLoop([createUserMessage("echo both")], context, config, controller.signal, () => {
+			const call = llmCalls++;
+			const mockStream = new MockAssistantStream();
+			queueMicrotask(() => {
+				if (call === 0) {
+					const message = createAssistantMessage(
+						[
+							{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "first" } },
+							{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "second" } },
+						],
+						"toolUse",
+					);
+					mockStream.push({ type: "done", reason: "toolUse", message });
+					return;
+				}
+				mockStream.push({
+					type: "error",
+					reason: "aborted",
+					error: createAssistantMessage([], "aborted"),
+				});
+			});
+			return mockStream;
+		});
+
+		const events: AgentEvent[] = [];
+		for await (const event of stream) {
+			events.push(event);
+		}
+
+		const toolExecutionEndIds = events.flatMap((event) =>
+			event.type === "tool_execution_end" ? [event.toolCallId] : [],
+		);
+		const toolResults = events.flatMap((event) => {
+			if (event.type !== "message_end" || event.message.role !== "toolResult") {
+				return [];
+			}
+			const text = event.message.content.find((content) => content.type === "text");
+			return [
+				{
+					id: event.message.toolCallId,
+					text: text?.type === "text" ? text.text : "",
+					isError: event.message.isError,
+				},
+			];
+		});
+
+		expect(executed).toEqual(["first"]);
+		expect(afterToolCalls).toEqual(["first"]);
+		expect(llmCalls).toBe(2);
+		expect(toolExecutionEndIds).toEqual(["tool-1", "tool-2"]);
+		expect(toolResults).toEqual([
+			{ id: "tool-1", text: "echoed: first", isError: false },
+			{ id: "tool-2", text: "Operation aborted", isError: true },
+		]);
+	});
+
 	it("should inject queued messages after all tool calls complete", async () => {
 		const toolSchema = Type.Object({ value: Type.String() });
 		const executed: string[] = [];
