@@ -242,6 +242,43 @@ describe("harness compaction", () => {
 		expect(findCutPoint([user, compaction, assistant], 0, 3, 1).firstKeptEntryIndex).toBe(2);
 	});
 
+	it("keeps the assistant tool call before an oversized trailing tool result", () => {
+		const toolCallId = "tool-call-1";
+		const user = createMessageEntry(createUserMessage("Inspect the repository"));
+		const assistant = createMessageEntry(
+			{
+				...createAssistantMessage(""),
+				content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "large.txt" } }],
+				stopReason: "toolUse",
+			},
+			user.id,
+		);
+		const toolResult = createMessageEntry(
+			{
+				role: "toolResult",
+				toolCallId,
+				toolName: "read",
+				content: [{ type: "text", text: "x".repeat(100_000) }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+			assistant.id,
+		);
+		const entries: Entry[] = [user, assistant, toolResult];
+
+		expect(findCutPoint(entries, 0, entries.length, 1_000)).toEqual({
+			firstKeptEntryIndex: 1,
+			turnStartIndex: 0,
+			isSplitTurn: true,
+		});
+
+		const preparation = getOrThrow(
+			prepareCompaction(entries, { ...DEFAULT_COMPACTION_SETTINGS, keepRecentTokens: 1_000 }),
+		);
+		expect(preparation?.retainedTail).toEqual([assistant.message, toolResult.message]);
+		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
+	});
+
 	it("estimates tokens and context usage across supported message roles", () => {
 		const usage = createMockUsage(10, 5, 3, 2);
 		const assistant = createAssistantMessage("assistant", usage);

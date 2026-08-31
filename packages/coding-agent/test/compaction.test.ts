@@ -1,5 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AssistantMessage, Usage } from "@earendil-works/pi-ai/compat";
+import type { AssistantMessage, ToolResultMessage, Usage } from "@earendil-works/pi-ai/compat";
 import { getModel } from "@earendil-works/pi-ai/compat";
 import { readFileSync } from "fs";
 import { join } from "path";
@@ -331,6 +331,40 @@ describe("findCutPoint", () => {
 
 		const result = findCutPoint(entries, 0, entries.length, 50000);
 		expect(result.firstKeptEntryIndex).toBe(0);
+	});
+
+	it("should keep the assistant tool call before an oversized trailing tool result", () => {
+		const toolCallId = "tool-call-1";
+		const user = createMessageEntry(createUserMessage("Inspect the repository"));
+		const assistant = createMessageEntry({
+			...createAssistantMessage(""),
+			content: [{ type: "toolCall", id: toolCallId, name: "read", arguments: { path: "large.txt" } }],
+			stopReason: "toolUse",
+		});
+		const toolResult: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId,
+			toolName: "read",
+			content: [{ type: "text", text: "x".repeat(100_000) }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const toolResultEntry = createMessageEntry(toolResult);
+		const entries: SessionEntry[] = [user, assistant, toolResultEntry];
+
+		expect(findCutPoint(entries, 0, entries.length, 1_000)).toEqual({
+			firstKeptEntryIndex: 1,
+			turnStartIndex: 0,
+			isSplitTurn: true,
+		});
+
+		const preparation = prepareCompaction(entries, {
+			...DEFAULT_COMPACTION_SETTINGS,
+			keepRecentTokens: 1_000,
+		});
+		expect(preparation).toBeDefined();
+		expect(preparation?.firstKeptEntryId).toBe(assistant.id);
+		expect(preparation?.turnPrefixMessages).toEqual([user.message]);
 	});
 
 	it("should indicate split turn when cutting at assistant message", () => {

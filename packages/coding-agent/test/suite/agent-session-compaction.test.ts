@@ -95,6 +95,44 @@ function seedCompactableSession(harness: Harness): void {
 	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
 }
 
+function createLargeResultTool(): AgentTool {
+	return {
+		name: "large_result",
+		label: "Large result",
+		description: "Returns enough content to cross the compaction threshold",
+		parameters: Type.Object({}),
+		execute: async () => ({
+			content: [{ type: "text", text: `large-tool-result:${"x".repeat(6800)}` }],
+			details: {},
+		}),
+	};
+}
+
+function seedOversizedHistory(harness: Harness): void {
+	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 1 } });
+	const now = Date.now();
+	harness.sessionManager.appendMessage({
+		role: "user",
+		content: [{ type: "text", text: "message to compact ".repeat(200) }],
+		timestamp: now - 1000,
+	});
+	const assistant = createAssistant(harness, {
+		stopReason: "stop",
+		totalTokens: 100,
+		timestamp: now - 500,
+	});
+	assistant.content = [{ type: "text", text: "assistant response to compact ".repeat(200) }];
+	harness.sessionManager.appendMessage(assistant);
+	harness.session.agent.state.messages = harness.sessionManager.buildSessionContext().messages;
+	harness.settingsManager.applyOverrides({ compaction: { keepRecentTokens: 100 } });
+}
+
+function createLargeToolUse(harness: Harness, toolName: string): AssistantMessage {
+	const toolUse = createAssistant(harness, { stopReason: "toolUse", totalTokens: 4950 });
+	toolUse.content = [{ type: "toolCall", id: "large-1", name: toolName, arguments: {} }];
+	return toolUse;
+}
+
 describe("AgentSession compaction characterization", () => {
 	const harnesses: Harness[] = [];
 
@@ -395,19 +433,13 @@ describe("AgentSession compaction characterization", () => {
 	});
 
 	it("compacts after a tool result before the next assistant request in the same run", async () => {
-		const toolResult = `large-tool-result:${"x".repeat(6800)}`;
-		const largeTool: AgentTool = {
-			name: "large_result",
-			label: "Large result",
-			description: "Returns enough content to cross the compaction threshold",
-			parameters: Type.Object({}),
-			execute: async () => ({ content: [{ type: "text", text: toolResult }], details: {} }),
-		};
+		const tool = createLargeResultTool();
 		const order: string[] = [];
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 } },
-			tools: [largeTool],
+			models: [{ id: "faux-1", contextWindow: 5000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 100 } },
+			tools: [tool],
+			initialActiveToolNames: [tool.name],
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", (event) => {
@@ -425,45 +457,176 @@ describe("AgentSession compaction characterization", () => {
 			],
 		});
 		harnesses.push(harness);
+		seedOversizedHistory(harness);
+		const toolUse = createLargeToolUse(harness, tool.name);
+		let requestCount = 0;
 		let resumedRequest = "";
-		harness.setResponses([
-			fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
-			fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
-			fauxAssistantMessage(fauxToolCall("large_result", {}), { stopReason: "toolUse" }),
-			(context) => {
+		harness.session.agent.streamFunction = (_model, context) => {
+			const stream = createAssistantMessageEventStream();
+			const message = requestCount === 0 ? toolUse : createAssistant(harness, { stopReason: "stop" });
+			if (requestCount > 0) {
 				order.push("provider");
 				resumedRequest = JSON.stringify(context.messages);
-				return fauxAssistantMessage("finished after compaction");
-			},
-		]);
+				message.content = [{ type: "text", text: "finished after compaction" }];
+			}
+			requestCount++;
+			const reason = message.content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+			queueMicrotask(() => stream.push({ type: "done", reason, message }));
+			return stream;
+		};
 
-		await harness.session.prompt("seed old history");
-		await harness.session.prompt("seed recent history");
-		const agentStartsBefore = harness.eventsOfType("agent_start").length;
 		await harness.session.prompt("run the large tool");
 
 		expect(order).toEqual(["compaction", "provider"]);
-		expect(harness.eventsOfType("agent_start")).toHaveLength(agentStartsBefore + 1);
+		expect(requestCount).toBe(2);
 		expect(harness.eventsOfType("compaction_start").at(-1)).toEqual({
 			type: "compaction_start",
-			reason: "threshold",
+			reason: "overflow",
 		});
 		expect(resumedRequest).toContain("compacted history");
 		expect(resumedRequest).toContain("large-tool-result");
 		expect(harness.session.getLastAssistantText()).toBe("finished after compaction");
 	});
 
-	it("includes steering queued during compaction in the resumed assistant request", async () => {
-		const largeTool: AgentTool = {
-			name: "large_result",
-			label: "Large result",
-			description: "Returns enough content to cross the compaction threshold",
-			parameters: Type.Object({}),
-			execute: async () => ({
-				content: [{ type: "text", text: `large-tool-result:${"x".repeat(6800)}` }],
-				details: {},
-			}),
+	it("fails closed when next-turn compaction is cancelled", async () => {
+		const tool = createLargeResultTool();
+		let compactionAttempts = 0;
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 5000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 100 } },
+			tools: [tool],
+			initialActiveToolNames: [tool.name],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", () => {
+						compactionAttempts++;
+						return { cancel: true };
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedOversizedHistory(harness);
+		const toolUse = createLargeToolUse(harness, tool.name);
+		let requestCount = 0;
+		harness.session.agent.streamFunction = () => {
+			requestCount++;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "toolUse", message: toolUse }));
+			return stream;
 		};
+
+		await harness.session.prompt("run the large tool");
+
+		expect(requestCount).toBe(1);
+		expect(compactionAttempts).toBe(1);
+		expect(harness.eventsOfType("compaction_end")).toHaveLength(1);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "overflow",
+			aborted: true,
+		});
+		expect(harness.session.messages.at(-1)).toMatchObject({
+			role: "assistant",
+			stopReason: "error",
+			errorMessage: "Compaction cancelled before the next assistant response.",
+		});
+	});
+
+	it("fails closed when compaction leaves the next-turn context over budget", async () => {
+		const tool = createLargeResultTool();
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 5000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 100 } },
+			tools: [tool],
+			initialActiveToolNames: [tool.name],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", (event) => ({
+						compaction: {
+							summary: "y".repeat(25_000),
+							firstKeptEntryId: event.preparation.firstKeptEntryId,
+							tokensBefore: event.preparation.tokensBefore,
+							details: {},
+						},
+					}));
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedOversizedHistory(harness);
+		const toolUse = createLargeToolUse(harness, tool.name);
+		let requestCount = 0;
+		harness.session.agent.streamFunction = () => {
+			requestCount++;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "toolUse", message: toolUse }));
+			return stream;
+		};
+
+		await harness.session.prompt("run the large tool");
+
+		expect(requestCount).toBe(1);
+		expect(harness.sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(true);
+		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "error" });
+		expect((harness.session.messages.at(-1) as AssistantMessage).errorMessage).toContain(
+			"Context still exceeds the next-turn budget after compaction",
+		);
+	});
+
+	it("aborts in-flight next-turn compaction without another provider request", async () => {
+		const tool = createLargeResultTool();
+		let markCompactionStarted = () => {};
+		const compactionStarted = new Promise<void>((resolve) => {
+			markCompactionStarted = resolve;
+		});
+		const harness = await createHarness({
+			models: [{ id: "faux-1", contextWindow: 5000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 100 } },
+			tools: [tool],
+			initialActiveToolNames: [tool.name],
+			extensionFactories: [
+				(pi) => {
+					pi.on("session_before_compact", async (event) => {
+						markCompactionStarted();
+						await new Promise<never>((_resolve, reject) => {
+							event.signal.addEventListener(
+								"abort",
+								() => reject(event.signal.reason ?? new DOMException("Aborted", "AbortError")),
+								{ once: true },
+							);
+						});
+					});
+				},
+			],
+		});
+		harnesses.push(harness);
+		seedOversizedHistory(harness);
+		const toolUse = createLargeToolUse(harness, tool.name);
+		let requestCount = 0;
+		harness.session.agent.streamFunction = () => {
+			requestCount++;
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => stream.push({ type: "done", reason: "toolUse", message: toolUse }));
+			return stream;
+		};
+
+		const prompt = harness.session.prompt("run the large tool");
+		await compactionStarted;
+		await harness.session.abort();
+		await prompt;
+
+		expect(requestCount).toBe(1);
+		expect(harness.sessionManager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+		expect(harness.eventsOfType("compaction_end").at(-1)).toMatchObject({
+			reason: "overflow",
+			aborted: true,
+		});
+		expect(harness.session.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+		expect(harness.session.isIdle).toBe(true);
+	});
+
+	it("includes steering queued during compaction in the resumed assistant request", async () => {
+		const tool = createLargeResultTool();
 		let markCompactionStarted = () => {};
 		const compactionStarted = new Promise<void>((resolve) => {
 			markCompactionStarted = resolve;
@@ -473,9 +636,10 @@ describe("AgentSession compaction characterization", () => {
 			releaseCompaction = resolve;
 		});
 		const harness = await createHarness({
-			models: [{ id: "faux-1", contextWindow: 2600, maxTokens: 100 }],
-			settings: { compaction: { enabled: true, reserveTokens: 400, keepRecentTokens: 1750 } },
-			tools: [largeTool],
+			models: [{ id: "faux-1", contextWindow: 5000, maxTokens: 100 }],
+			settings: { compaction: { enabled: true, reserveTokens: 100, keepRecentTokens: 100 } },
+			tools: [tool],
+			initialActiveToolNames: [tool.name],
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_before_compact", async (event) => {
@@ -494,20 +658,23 @@ describe("AgentSession compaction characterization", () => {
 			],
 		});
 		harnesses.push(harness);
+		seedOversizedHistory(harness);
+		const toolUse = createLargeToolUse(harness, tool.name);
+		let requestCount = 0;
 		let resumedRequest = "";
-		harness.setResponses([
-			fauxAssistantMessage(`old-history:${"a".repeat(800)}`),
-			fauxAssistantMessage(`recent-history:${"b".repeat(800)}`),
-			fauxAssistantMessage(fauxToolCall("large_result", {}), { stopReason: "toolUse" }),
-			(context) => {
+		harness.session.agent.streamFunction = (_model, context) => {
+			const stream = createAssistantMessageEventStream();
+			const message = requestCount === 0 ? toolUse : createAssistant(harness, { stopReason: "stop" });
+			if (requestCount > 0) {
 				resumedRequest = JSON.stringify(context.messages);
-				return fauxAssistantMessage("finished after compaction");
-			},
-			fauxAssistantMessage("finished after delayed steering"),
-		]);
+				message.content = [{ type: "text", text: "finished after compaction" }];
+			}
+			requestCount++;
+			const reason = message.content.some((block) => block.type === "toolCall") ? "toolUse" : "stop";
+			queueMicrotask(() => stream.push({ type: "done", reason, message }));
+			return stream;
+		};
 
-		await harness.session.prompt("seed old history");
-		await harness.session.prompt("seed recent history");
 		const promptPromise = harness.session.prompt("run the large tool");
 		await compactionStarted;
 		await harness.session.steer("change direction");
@@ -515,7 +682,7 @@ describe("AgentSession compaction characterization", () => {
 		await promptPromise;
 
 		expect(resumedRequest).toContain("change direction");
-		expect(harness.faux.state.callCount).toBe(4);
+		expect(requestCount).toBe(2);
 	});
 
 	it("does not compact after a terminating tool result", async () => {
