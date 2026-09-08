@@ -103,7 +103,7 @@ import { expandPromptTemplate, type PromptTemplate } from "./prompt-templates.ts
 import type { ResourceExtensionPaths, ResourceLoader } from "./resource-loader.ts";
 import { exportSessionToJsonl } from "./session-export.ts";
 import type { BranchSummaryEntry, CompactionEntry, SessionEntry, SessionManager } from "./session-manager.ts";
-import { getLatestCompactionEntry } from "./session-manager.ts";
+import { buildSessionContext, getLatestCompactionEntry } from "./session-manager.ts";
 import type { SettingsManager } from "./settings-manager.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.ts";
@@ -303,6 +303,11 @@ function estimateMessagesTokens(messages: AgentMessage[]): number {
 		tokens += estimateTokens(message);
 	}
 	return tokens;
+}
+
+function estimateFullContextTokens(context: AgentContext): number {
+	const toolChars = JSON.stringify(context.tools ?? []).length;
+	return estimateMessagesTokens(context.messages) + Math.ceil((context.systemPrompt.length + toolChars) / 4);
 }
 
 // ============================================================================
@@ -555,9 +560,7 @@ export class AgentSession {
 			usageMessage.provider === model.provider &&
 			usageMessage.model === model.id &&
 			(!latestCompaction || usageMessage.timestamp > new Date(latestCompaction.timestamp).getTime());
-		const toolChars = JSON.stringify(context.tools ?? []).length;
-		const fullEstimate =
-			estimateMessagesTokens(context.messages) + Math.ceil((context.systemPrompt.length + toolChars) / 4);
+		const fullEstimate = estimateFullContextTokens(context);
 		// Prefer the larger estimate: unnecessary compaction is safer than dispatching an oversized turn.
 		return hasCurrentModelUsage ? Math.max(estimate.tokens, fullEstimate) : fullEstimate;
 	}
@@ -1161,6 +1164,13 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		if (this.agent.state.messages.length > 0) {
+			await this._compactBeforeNextAssistantResponse({
+				systemPrompt: this.agent.state.systemPrompt,
+				messages: this.agent.state.messages.slice(),
+				tools: this.agent.state.tools.slice(),
+			});
+		}
 		this._nextTurnCompactionFailed = false;
 		this._isAgentRunActive = true;
 		try {
@@ -1313,7 +1323,7 @@ export class AgentSession {
 			// The user's new prompt is sent below, so do not call agent.continue() here.
 			const lastAssistant = this._findLastAssistantMessage();
 			if (lastAssistant) {
-				await this._checkCompaction(lastAssistant, false);
+				await this._checkCompaction(lastAssistant, false, true);
 			}
 
 			// Build messages array (custom message if any, then user message)
@@ -2183,9 +2193,14 @@ export class AgentSession {
 	 *
 	 * @param assistantMessage The assistant message to check
 	 * @param skipAbortedCheck If false, include aborted messages (for pre-prompt check). Default: true
+	 * @param failClosed If true, reject unsuccessful or insufficient compaction instead of continuing to a provider request
 	 * @returns Whether the post-run loop should call `agent.continue()` for overflow recovery or queued messages
 	 */
-	private async _checkCompaction(assistantMessage: AssistantMessage, skipAbortedCheck = true): Promise<boolean> {
+	private async _checkCompaction(
+		assistantMessage: AssistantMessage,
+		skipAbortedCheck = true,
+		failClosed = false,
+	): Promise<boolean> {
 		const settings = this.settingsManager.getCompactionSettings();
 		if (!settings.enabled) return false;
 
@@ -2222,7 +2237,9 @@ export class AgentSession {
 			// Case 2: the response completed successfully. Compact, but do not retry because
 			// agent.continue() cannot continue from a completed assistant response.
 			if (!willRetry) {
-				return await this._runAutoCompaction("overflow", false);
+				return failClosed
+					? await this._runAutoCompaction("overflow", false, { failClosed: true })
+					: await this._runAutoCompaction("overflow", false);
 			}
 
 			if (this._overflowRecoveryAttempted) {
@@ -2254,7 +2271,9 @@ export class AgentSession {
 			if (messages.length > 0 && messages[messages.length - 1].role === "assistant") {
 				this.agent.state.messages = messages.slice(0, -1);
 			}
-			return await this._runAutoCompaction("overflow", willRetry);
+			return failClosed
+				? await this._runAutoCompaction("overflow", willRetry, { failClosed: true })
+				: await this._runAutoCompaction("overflow", willRetry);
 		}
 
 		// Case 3: threshold compaction without retry.
@@ -2286,7 +2305,9 @@ export class AgentSession {
 			contextTokens = directContextTokens;
 		}
 		if (shouldCompact(contextTokens, contextWindow, settings)) {
-			return await this._runAutoCompaction("threshold", false);
+			return failClosed
+				? await this._runAutoCompaction("threshold", false, { failClosed: true })
+				: await this._runAutoCompaction("threshold", false);
 		}
 		return false;
 	}
@@ -2455,6 +2476,30 @@ export class AgentSession {
 						: new Error("Compaction cancelled");
 				}
 				return false;
+			}
+
+			const pendingCompaction: CompactionEntry = {
+				type: "compaction",
+				id: "__pending_compaction__",
+				parentId: pathEntries.at(-1)?.id ?? null,
+				timestamp: new Date().toISOString(),
+				summary,
+				firstKeptEntryId,
+				tokensBefore,
+				details,
+				usage,
+				fromHook: fromExtension,
+			};
+			const compactedMessages = buildSessionContext([...pathEntries, pendingCompaction]).messages;
+			const compactedTokens = estimateFullContextTokens({
+				systemPrompt: this.agent.state.systemPrompt,
+				messages: compactedMessages,
+				tools: this.agent.state.tools,
+			});
+			if (shouldCompact(compactedTokens, model.contextWindow, settings)) {
+				throw new Error(
+					`Context still exceeds the next-turn budget after compaction (${compactedTokens} > ${model.contextWindow - settings.reserveTokens} tokens).`,
+				);
 			}
 
 			this.sessionManager.appendCompaction(summary, firstKeptEntryId, tokensBefore, details, fromExtension, usage);
