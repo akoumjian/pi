@@ -2,13 +2,14 @@ interface StdoutTakeoverState {
 	rawStdoutWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
 	rawStderrWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
 	originalStdoutWrite: typeof process.stdout.write;
+	originalStderrWrite: typeof process.stderr.write;
 }
 
-type RawStdoutFailureHandler = (error: Error) => void;
+type RawOutputFailureHandler = (error: Error) => void;
 
 let stdoutTakeoverState: StdoutTakeoverState | undefined;
-let rawStdoutFailure: Error | undefined;
-let rawStdoutFailureHandler: RawStdoutFailureHandler | undefined;
+let rawOutputFailure: Error | undefined;
+let rawOutputFailureHandler: RawOutputFailureHandler | undefined;
 
 const RAW_STDOUT_RETRY_DELAY_MS = 10;
 
@@ -25,18 +26,18 @@ function normalizeError(error: unknown): Error {
 	return error instanceof Error ? error : new Error(String(error));
 }
 
-function reportRawStdoutFailure(error: unknown): void {
-	if (rawStdoutFailure) return;
-	rawStdoutFailure = normalizeError(error);
-	if (rawStdoutFailureHandler) {
-		rawStdoutFailureHandler(rawStdoutFailure);
+function reportRawOutputFailure(error: unknown): void {
+	if (rawOutputFailure) return;
+	rawOutputFailure = normalizeError(error);
+	if (rawOutputFailureHandler) {
+		rawOutputFailureHandler(rawOutputFailure);
 		return;
 	}
 	process.exit(1);
 }
 
 async function writeRawStdoutChunk(text: string): Promise<void> {
-	while (!rawStdoutFailure) {
+	while (!rawOutputFailure) {
 		try {
 			await new Promise<void>((resolve, reject) => {
 				try {
@@ -53,7 +54,7 @@ async function writeRawStdoutChunk(text: string): Promise<void> {
 			const writeError = normalizeError(error);
 			const code = (writeError as Error & { code?: unknown }).code;
 			if (code !== "ENOBUFS" && code !== "EAGAIN" && code !== "EWOULDBLOCK") {
-				reportRawStdoutFailure(writeError);
+				reportRawOutputFailure(writeError);
 				return;
 			}
 			await new Promise<void>((resolve) => setTimeout(resolve, RAW_STDOUT_RETRY_DELAY_MS));
@@ -69,31 +70,47 @@ export function takeOverStdout(): void {
 	const rawStdoutWrite = process.stdout.write.bind(process.stdout) as StdoutTakeoverState["rawStdoutWrite"];
 	const rawStderrWrite = process.stderr.write.bind(process.stderr) as StdoutTakeoverState["rawStderrWrite"];
 	const originalStdoutWrite = process.stdout.write;
+	const originalStderrWrite = process.stderr.write;
 
-	process.stdout.write = ((
+	const guardedStderrWrite = (
 		chunk: string | Uint8Array,
 		encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
 		callback?: (error?: Error | null) => void,
 	): boolean => {
-		if (typeof encodingOrCallback === "function") {
-			return rawStderrWrite(String(chunk), encodingOrCallback);
+		const writeCallback = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+		if (rawOutputFailure) {
+			writeCallback?.();
+			return true;
 		}
-		return rawStderrWrite(String(chunk), callback);
-	}) as typeof process.stdout.write;
+		try {
+			return rawStderrWrite(String(chunk), (error) => {
+				if (error) reportRawOutputFailure(error);
+				writeCallback?.();
+			});
+		} catch (error) {
+			reportRawOutputFailure(error);
+			writeCallback?.();
+			return true;
+		}
+	};
+
+	process.stdout.write = guardedStderrWrite as typeof process.stdout.write;
+	process.stderr.write = guardedStderrWrite as typeof process.stderr.write;
 
 	stdoutTakeoverState = {
 		rawStdoutWrite,
 		rawStderrWrite,
 		originalStdoutWrite,
+		originalStderrWrite,
 	};
 }
-
 export function restoreStdout(): void {
 	if (!stdoutTakeoverState) {
 		return;
 	}
 
 	process.stdout.write = stdoutTakeoverState.originalStdoutWrite;
+	process.stderr.write = stdoutTakeoverState.originalStderrWrite;
 	stdoutTakeoverState = undefined;
 }
 
@@ -101,27 +118,32 @@ export function isStdoutTakenOver(): boolean {
 	return stdoutTakeoverState !== undefined;
 }
 
-/** Register mode-specific cleanup for fatal raw stdout write errors or stream closure. */
-export function registerRawStdoutFailureHandler(handler: RawStdoutFailureHandler): () => void {
-	rawStdoutFailureHandler = handler;
+/** Register mode-specific cleanup for fatal raw stdout or redirected stderr failure. */
+export function registerRawOutputFailureHandler(handler: RawOutputFailureHandler): () => void {
+	rawOutputFailureHandler = handler;
 	const stdout = process.stdout;
-	const onError = (error: Error) => reportRawStdoutFailure(error);
-	const onClose = () => reportRawStdoutFailure(new Error("Raw stdout closed"));
+	const stderr = process.stderr;
+	const onError = (error: Error) => reportRawOutputFailure(error);
+	const onClose = () => reportRawOutputFailure(new Error("Raw output closed"));
 	stdout.on("error", onError);
 	stdout.on("close", onClose);
-	const existingFailure = rawStdoutFailure;
+	stderr.on("error", onError);
+	stderr.on("close", onClose);
+	const existingFailure = rawOutputFailure;
 	if (existingFailure) queueMicrotask(() => handler(existingFailure));
-	else if (stdout.destroyed) queueMicrotask(onClose);
+	else if (stdout.destroyed || stderr.destroyed) queueMicrotask(onClose);
 
 	return () => {
 		stdout.off("error", onError);
 		stdout.off("close", onClose);
-		if (rawStdoutFailureHandler === handler) rawStdoutFailureHandler = undefined;
+		stderr.off("error", onError);
+		stderr.off("close", onClose);
+		if (rawOutputFailureHandler === handler) rawOutputFailureHandler = undefined;
 	};
 }
 
 export function writeRawStdout(text: string): void {
-	if (text.length === 0 || rawStdoutFailure) {
+	if (text.length === 0 || rawOutputFailure) {
 		return;
 	}
 	rawStdoutWriteTail = rawStdoutWriteTail.then(() => writeRawStdoutChunk(text));
@@ -138,8 +160,8 @@ export async function waitForRawStdoutBackpressure(): Promise<void> {
 }
 
 export async function flushRawStdout(): Promise<void> {
-	if (rawStdoutFailure) return;
+	if (rawOutputFailure) return;
 	await waitForRawStdoutBackpressure();
-	if (rawStdoutFailure) return;
+	if (rawOutputFailure) return;
 	await writeRawStdoutChunk("");
 }

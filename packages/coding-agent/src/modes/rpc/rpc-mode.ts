@@ -23,7 +23,7 @@ import type {
 } from "../../core/extensions/index.ts";
 import {
 	flushRawStdout,
-	registerRawStdoutFailureHandler,
+	registerRawOutputFailureHandler,
 	takeOverStdout,
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
@@ -112,8 +112,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	const isClosing = (): boolean => lifecycleState === "closing" || lifecycleState === "closed";
 	let extensionShutdownRequested = false;
 	let activeCommandExecutions = 0;
-	let rawStdoutFailed = false;
-	let removeRawStdoutFailureHandler = () => {};
+	let rawOutputFailed = false;
+	let removeRawOutputFailureHandler = () => {};
+	let removeProcessExitContainment = () => {};
 	let shutdownPromise: Promise<void> | undefined;
 	let shutdownExitCode = 0;
 	let shutdownSignal: NodeJS.Signals | undefined;
@@ -765,8 +766,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			!extensionShutdownRequested ||
 			lifecycleState !== "ready" ||
 			activeCommandExecutions !== 0 ||
-			session.isStreaming ||
-			session.isCompacting
+			session.isStreaming
 		) {
 			return;
 		}
@@ -799,10 +799,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				await runtimeHost.dispose();
 			} finally {
 				try {
-					if (!rawStdoutFailed && shutdownSignal !== "SIGTERM") await flushRawStdout();
+					if (!rawOutputFailed && shutdownSignal !== "SIGTERM") await flushRawStdout();
 				} finally {
 					lifecycleState = "closed";
-					removeRawStdoutFailureHandler();
+					removeRawOutputFailureHandler();
+					removeProcessExitContainment();
 					for (const cleanup of signalCleanupHandlers.splice(0)) cleanup();
 					try {
 						killTrackedDetachedChildren();
@@ -815,10 +816,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		return shutdownPromise;
 	}
 
-	removeRawStdoutFailureHandler = registerRawStdoutFailureHandler(() => {
-		rawStdoutFailed = true;
+	removeRawOutputFailureHandler = registerRawOutputFailureHandler(() => {
+		rawOutputFailed = true;
 		if (!isClosing()) void shutdown(1);
 	});
+	if (options.exit === undefined) {
+		const containUnexpectedExit = () => killTrackedDetachedChildren();
+		process.once("exit", containUnexpectedExit);
+		removeProcessExitContainment = () => process.off("exit", containUnexpectedExit);
+	}
 
 	const handleExtensionResponse = (parsed: unknown, line: string): boolean => {
 		if (typeof parsed !== "object" || parsed === null || !("type" in parsed)) return false;

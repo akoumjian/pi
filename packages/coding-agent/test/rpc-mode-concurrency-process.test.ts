@@ -1,4 +1,4 @@
-import { type ChildProcess, execFileSync, spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,35 +14,20 @@ function shellQuote(value: string): string {
 	return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
-function findTaggedProcesses(tag: string): number[] {
-	const output = execFileSync("ps", ["-eo", "pid=,args="], { encoding: "utf8" });
-	return output
-		.split("\n")
-		.filter((line) => line.includes(tag))
-		.map((line) => Number.parseInt(line.trim().split(/\s+/, 1)[0] ?? "", 10))
-		.filter((pid) => Number.isSafeInteger(pid) && pid > 1 && pid !== process.pid);
-}
-
-function killTaggedProcesses(tag: string): void {
-	for (const pid of findTaggedProcesses(tag)) {
-		try {
-			process.kill(-pid, "SIGKILL");
-		} catch {
-			try {
-				process.kill(pid, "SIGKILL");
-			} catch {
-				// Already exited.
-			}
-		}
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch {
+		return false;
 	}
 }
 
-function isProcessAlive(pid: number): boolean {
+function killProcessIfAlive(pid: number): void {
 	try {
-		const state = execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim();
-		return state.length > 0 && !state.startsWith("Z");
+		process.kill(pid, "SIGKILL");
 	} catch {
-		return false;
+		// Already exited.
 	}
 }
 
@@ -111,6 +96,19 @@ export default function (pi: any) {
       if (marker) appendFileSync(marker, "done\\n");
     },
   });
+  pi.registerCommand("compact-shutdown-probe", {
+    description: "Compact and request graceful RPC shutdown",
+    handler: async (_args: string, ctx: any) => {
+      const marker = process.env.COMPACT_MARKER;
+      if (marker) appendFileSync(marker, "start\\n");
+      ctx.compact({
+        onComplete: () => marker && appendFileSync(marker, "complete\\n"),
+        onError: () => marker && appendFileSync(marker, "error\\n"),
+      });
+      ctx.shutdown();
+      if (marker) appendFileSync(marker, "requested\\n");
+    },
+  });
   pi.on("session_shutdown", async () => {
     const marker = process.env.SHUTDOWN_MARKER;
     if (!marker) return;
@@ -120,6 +118,10 @@ export default function (pi: any) {
       appendFileSync(marker, completed ? "after-response\\n" : "before-response\\n");
     }
     appendFileSync(marker, "start\\n");
+    if (process.env.SHUTDOWN_CONSOLE === "1") {
+      console.log("shutdown console.log probe");
+      console.error("shutdown console.error probe");
+    }
     await delay(Number(process.env.SHUTDOWN_DELAY || 200));
     appendFileSync(marker, "done\\n");
   });
@@ -164,7 +166,7 @@ describe.skipIf(process.platform === "win32" || !existsSync(builtCli))(
 		let shutdownMarker: string;
 		let client: RpcClient | undefined;
 		let rawChild: ChildProcess | undefined;
-		let trackedTags: string[];
+		let trackedPids: number[];
 
 		beforeEach(() => {
 			root = mkdtempSync(join(tmpdir(), "pi-rpc-lifecycle-"));
@@ -175,13 +177,13 @@ describe.skipIf(process.platform === "win32" || !existsSync(builtCli))(
 			mkdirSync(cwd, { recursive: true });
 			mkdirSync(agentDir, { recursive: true });
 			writeProbeExtension(agentDir);
-			trackedTags = [];
+			trackedPids = [];
 		});
 
 		afterEach(async () => {
 			if (client) await client.stop();
 			if (rawChild && rawChild.exitCode === null && rawChild.signalCode === null) rawChild.kill("SIGKILL");
-			for (const tag of trackedTags) killTaggedProcesses(tag);
+			for (const pid of trackedPids) killProcessIfAlive(pid);
 			rmSync(root, { recursive: true, force: true });
 		});
 
@@ -363,9 +365,9 @@ describe.skipIf(process.platform === "win32" || !existsSync(builtCli))(
 		}, 180_000);
 
 		it("uses nonzero shared cleanup when the stdout reader is destroyed", async () => {
-			const tag = `pi-rpc-stdout-loss-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-			trackedTags.push(tag);
+			const duration = `61.${Date.now()}${Math.floor(Math.random() * 1000)}`;
 			const bashMarker = join(root, "stdout-loss-bash-started");
+			const bashPidPath = join(root, "stdout-loss-bash.pid");
 			const raw = spawnRaw(cwd, {
 				PI_CODING_AGENT_DIR: agentDir,
 				SHUTDOWN_MARKER: shutdownMarker,
@@ -376,35 +378,110 @@ describe.skipIf(process.platform === "win32" || !existsSync(builtCli))(
 				interval: 20,
 			});
 			raw.child.stdin!.write(
-				`${JSON.stringify({ type: "bash", id: "silent", command: `touch ${shellQuote(bashMarker)}; exec -a ${tag} sleep 60` })}\n`,
+				`${JSON.stringify({
+					type: "bash",
+					id: "silent",
+					command: `touch ${shellQuote(bashMarker)}; sleep ${duration} & child=$!; echo $child > ${shellQuote(bashPidPath)}; wait $child`,
+				})}\n`,
 			);
 			await waitForFile(bashMarker);
+			await waitForFile(bashPidPath);
+			const bashPid = Number.parseInt(readFileSync(bashPidPath, "utf8"), 10);
+			trackedPids.push(bashPid);
+			expect(isProcessAlive(bashPid)).toBe(true);
 			raw.child.stdout!.destroy();
 			raw.child.stdin!.write(`${JSON.stringify({ type: "get_state", id: "break-output" })}\n`);
 
 			const exit = await withTimeout(raw.exited, 10_000, `stdout-loss shutdown stalled; stderr: ${raw.stderr()}`);
 			expect(exit).toEqual({ code: 1, signal: null });
 			expect(readFileSync(shutdownMarker, "utf8")).toBe("start\ndone\n");
-			await vi.waitFor(() => expect(findTaggedProcesses(tag)).toEqual([]), { timeout: 5000, interval: 25 });
+			await vi.waitFor(() => expect(isProcessAlive(bashPid)).toBe(false), { timeout: 5000, interval: 25 });
 			rawChild = undefined;
 		}, 180_000);
 
-		it("cleans silent and streaming sleeps when their real RPC host crashes", async () => {
-			const silentTag = `pi-rpc-host-crash-silent-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-			const streamingTag = `pi-rpc-host-crash-stream-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-			trackedTags.push(silentTag, streamingTag);
+		it("completes startup cleanup when stdout and stderr close before a rejection write", async () => {
+			const raw = spawnRaw(cwd, {
+				PI_CODING_AGENT_DIR: agentDir,
+				STARTUP_MARKER: startupMarker,
+				START_DELAY: "3000",
+				SHUTDOWN_CONSOLE: "1",
+				SHUTDOWN_MARKER: shutdownMarker,
+			});
+			rawChild = raw.child;
+			await waitForFileText(startupMarker, "start\n");
+			raw.child.stdout!.destroy();
+			raw.child.stderr!.destroy();
+			raw.child.stdin!.write(`${JSON.stringify({ type: "get_state", id: "break-startup-output" })}\n`);
+
+			const exit = await withTimeout(raw.exited, 10_000, "startup output-loss shutdown stalled");
+			expect(exit).toEqual({ code: 1, signal: null });
+			expect(readFileSync(shutdownMarker, "utf8")).toBe("start\ndone\n");
+			rawChild = undefined;
+		}, 180_000);
+
+		it("completes logged cleanup when the real RPC host crashes during startup", async () => {
+			const piPidPath = join(root, "startup-pi.pid");
+			const hostScript = join(root, "startup-host.mjs");
+			writeFileSync(
+				hostScript,
+				`import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+const [cli, cwd, agentDir, pidPath, startupMarker, shutdownMarker] = process.argv.slice(2);
+const child = spawn(process.execPath, [cli, "--mode", "rpc"], {
+  cwd,
+  env: {
+    ...process.env,
+    PI_CODING_AGENT_DIR: agentDir,
+    STARTUP_MARKER: startupMarker,
+    START_DELAY: "3000",
+    SHUTDOWN_CONSOLE: "1",
+    SHUTDOWN_MARKER: shutdownMarker,
+  },
+  stdio: ["pipe", "pipe", "pipe"],
+});
+writeFileSync(pidPath, String(child.pid));
+child.stdout.resume();
+child.stderr.resume();
+child.on("exit", () => process.exit(0));
+`,
+			);
+			const host = spawn(
+				process.execPath,
+				[hostScript, builtCli, cwd, agentDir, piPidPath, startupMarker, shutdownMarker],
+				{ stdio: "ignore" },
+			);
+			rawChild = host;
+			await waitForFileText(startupMarker, "start\n");
+			const piPid = Number.parseInt(readFileSync(piPidPath, "utf8"), 10);
+			trackedPids.push(piPid);
+			expect(isProcessAlive(piPid)).toBe(true);
+			expect(host.kill("SIGKILL")).toBe(true);
+			await new Promise<void>((resolve) => host.once("exit", () => resolve()));
+			rawChild = undefined;
+
+			await waitForFileText(shutdownMarker, "done\n", 10_000);
+			expect(readFileSync(shutdownMarker, "utf8")).toBe("start\ndone\n");
+			await vi.waitFor(() => expect(isProcessAlive(piPid)).toBe(false), { timeout: 10_000, interval: 25 });
+		}, 180_000);
+
+		it("cleans positive-control silent and streaming processes when their real RPC host crashes", async () => {
+			const nonce = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
+			const silentDuration = `62.${nonce}`;
+			const streamingTag = `pi-rpc-host-crash-stream-${nonce}`;
 			const piPidPath = join(root, "pi.pid");
 			const silentMarker = join(root, "host-silent-started");
 			const streamingMarker = join(root, "host-streaming-started");
+			const silentPidPath = join(root, "host-silent.pid");
+			const streamingPidPath = join(root, "host-streaming.pid");
 			const hostScript = join(root, "host.mjs");
 			writeFileSync(
 				hostScript,
 				`import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
-const [cli, cwd, agentDir, pidPath, shutdownMarker, silentMarker, streamingMarker, silentTag, streamingTag] = process.argv.slice(2);
+const [cli, cwd, agentDir, pidPath, shutdownMarker, silentMarker, streamingMarker, silentPidPath, streamingPidPath, silentDuration, streamingTag] = process.argv.slice(2);
 const child = spawn(process.execPath, [cli, "--mode", "rpc"], {
   cwd,
-  env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, SHUTDOWN_MARKER: shutdownMarker },
+  env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, SHUTDOWN_CONSOLE: "1", SHUTDOWN_MARKER: shutdownMarker },
   stdio: ["pipe", "pipe", "pipe"],
 });
 writeFileSync(pidPath, String(child.pid));
@@ -421,8 +498,8 @@ child.stdout.on("data", (chunk) => {
     try { record = JSON.parse(line); } catch { continue; }
     if (!started && record?.type === "rpc_ready" && Object.keys(record).length === 1) {
       started = true;
-      child.stdin.write(JSON.stringify({ type: "bash", id: "silent", command: "touch " + JSON.stringify(silentMarker) + "; exec -a " + silentTag + " sleep 60" }) + "\\n");
-      child.stdin.write(JSON.stringify({ type: "bash", id: "streaming", command: "touch " + JSON.stringify(streamingMarker) + "; exec -a " + streamingTag + " bash -c 'while true; do printf stream; sleep 0.02; done'" }) + "\\n");
+      child.stdin.write(JSON.stringify({ type: "bash", id: "silent", command: "touch " + JSON.stringify(silentMarker) + "; sleep " + silentDuration + " & child=$!; echo $child > " + JSON.stringify(silentPidPath) + "; wait $child" }) + "\\n");
+      child.stdin.write(JSON.stringify({ type: "bash", id: "streaming", command: "touch " + JSON.stringify(streamingMarker) + "; echo $$ > " + JSON.stringify(streamingPidPath) + "; while true; do printf stream; sleep 0.02; done # " + streamingTag }) + "\\n");
     }
   }
 });
@@ -441,7 +518,9 @@ child.on("exit", () => process.exit(0));
 					shutdownMarker,
 					silentMarker,
 					streamingMarker,
-					silentTag,
+					silentPidPath,
+					streamingPidPath,
+					silentDuration,
 					streamingTag,
 				],
 				{ stdio: "ignore" },
@@ -449,8 +528,15 @@ child.on("exit", () => process.exit(0));
 			rawChild = host;
 			await waitForFile(silentMarker);
 			await waitForFile(streamingMarker);
+			await waitForFile(silentPidPath);
+			await waitForFile(streamingPidPath);
 			const piPid = Number.parseInt(readFileSync(piPidPath, "utf8"), 10);
+			const silentPid = Number.parseInt(readFileSync(silentPidPath, "utf8"), 10);
+			const streamingPid = Number.parseInt(readFileSync(streamingPidPath, "utf8"), 10);
+			trackedPids.push(piPid, silentPid, streamingPid);
 			expect(Number.isSafeInteger(piPid)).toBe(true);
+			expect(isProcessAlive(silentPid)).toBe(true);
+			expect(isProcessAlive(streamingPid)).toBe(true);
 			expect(host.kill("SIGKILL")).toBe(true);
 			await new Promise<void>((resolve) => host.once("exit", () => resolve()));
 			rawChild = undefined;
@@ -458,10 +544,28 @@ child.on("exit", () => process.exit(0));
 			await waitForFileText(shutdownMarker, "done\n", 10_000);
 			expect(readFileSync(shutdownMarker, "utf8")).toBe("start\ndone\n");
 			await vi.waitFor(() => expect(isProcessAlive(piPid)).toBe(false), { timeout: 10_000, interval: 25 });
-			await vi.waitFor(
-				() => expect([...findTaggedProcesses(silentTag), ...findTaggedProcesses(streamingTag)]).toEqual([]),
-				{ timeout: 5000, interval: 25 },
-			);
+			await vi.waitFor(() => expect(isProcessAlive(silentPid)).toBe(false), { timeout: 5000, interval: 25 });
+			await vi.waitFor(() => expect(isProcessAlive(streamingPid)).toBe(false), { timeout: 5000, interval: 25 });
+		}, 180_000);
+
+		it("does not wait for fire-and-forget compaction after the command response", async () => {
+			const compactMarker = join(root, "compact.log");
+			client = new RpcClient({
+				cliPath: builtCli,
+				cwd,
+				env: {
+					PI_CODING_AGENT_DIR: agentDir,
+					COMPACT_MARKER: compactMarker,
+					SHUTDOWN_MARKER: shutdownMarker,
+				},
+			});
+			await client.start();
+
+			await withTimeout(client.prompt("/compact-shutdown-probe"), 10_000, "compact shutdown response was lost");
+			await withTimeout(client.stop(), 10_000, "compact shutdown did not exit");
+			client = undefined;
+			expect(readFileSync(compactMarker, "utf8")).toContain("start\nrequested\n");
+			expect(readFileSync(shutdownMarker, "utf8")).toBe("start\ndone\n");
 		}, 180_000);
 	},
 );

@@ -14,7 +14,7 @@ const rpcIo = vi.hoisted(() => ({
 
 vi.mock("../src/core/output-guard.js", () => ({
 	flushRawStdout: rpcIo.flushRawStdout,
-	registerRawStdoutFailureHandler: vi.fn((handler: (error: Error) => void) => {
+	registerRawOutputFailureHandler: vi.fn((handler: (error: Error) => void) => {
 		rpcIo.rawStdoutFailureHandler = handler;
 		return () => {
 			if (rpcIo.rawStdoutFailureHandler === handler) rpcIo.rawStdoutFailureHandler = undefined;
@@ -485,6 +485,38 @@ describe("RPC startup lifecycle", () => {
 		expect(parseOutput()).toContainEqual({ id: "command", type: "response", command: "prompt", success: true });
 		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
 		expect(lifecycle).toEqual(["session_shutdown"]);
+	});
+
+	it("does not wait for fire-and-forget compaction after a command response", async () => {
+		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
+		const input = new PassThrough();
+		let bindings: ExtensionBindings | undefined;
+		const session = Object.assign(
+			createStateSession(async (nextBindings) => {
+				bindings = nextBindings;
+			}),
+			{
+				isCompacting: true,
+				prompt: async (_message: string, options: { preflightResult: (success: boolean) => void }) => {
+					options.preflightResult(true);
+					requestExtensionShutdown(bindings);
+				},
+			},
+		);
+		const runtimeHost = {
+			session,
+			setRebindSession: vi.fn(),
+			dispose: vi.fn(async () => {}),
+		} as unknown as AgentSessionRuntime;
+		const { exited } = startRpcMode(runtimeHost, input);
+		await waitForReady();
+
+		input.write('{"type":"prompt","id":"compact","message":"/compact-shutdown"}\n');
+		await expect(exited).resolves.toBe(0);
+		expect(parseOutput()).toContainEqual({ id: "compact", type: "response", command: "prompt", success: true });
+		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
 	});
 
 	it("waits for agent_settled after a tool requests shutdown", async () => {
