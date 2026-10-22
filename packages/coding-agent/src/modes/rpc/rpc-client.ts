@@ -26,6 +26,7 @@ import type {
 	RpcCommand,
 	RpcExtensionHostRequest,
 	RpcExtensionHostResponse,
+	RpcReadyMessage,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -44,6 +45,21 @@ type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
 interface ActiveHostRequest {
 	controller: AbortController;
 	retired: boolean;
+}
+
+interface PendingStart {
+	resolve: () => void;
+	reject: (error: Error) => void;
+}
+
+function isRpcReadyMessage(value: unknown): value is RpcReadyMessage {
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		Object.keys(value).length === 1 &&
+		"type" in value &&
+		value.type === "rpc_ready"
+	);
 }
 
 const HOST_FAILURE_DUPLICATE_ID = "Duplicate extension host request id";
@@ -111,6 +127,7 @@ export class RpcClient {
 	private activeHostExecutions = 0;
 	private stopping = false;
 	private stopPromise: Promise<void> | null = null;
+	private pendingStart: PendingStart | null = null;
 
 	constructor(options: RpcClientOptions = {}) {
 		this.options = options;
@@ -121,7 +138,7 @@ export class RpcClient {
 	}
 
 	/**
-	 * Start the RPC agent process.
+	 * Start the RPC agent process and wait for its exact readiness record.
 	 */
 	async start(): Promise<void> {
 		if (this.process) {
@@ -151,6 +168,9 @@ export class RpcClient {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 		this.process = childProcess;
+		const ready = new Promise<void>((resolve, reject) => {
+			this.pendingStart = { resolve, reject };
+		});
 
 		// Collect stderr for debugging
 		childProcess.stderr?.on("data", (data) => {
@@ -178,14 +198,10 @@ export class RpcClient {
 		});
 		childProcess.stdout?.once("end", () => this.onStdoutEnd(childProcess));
 
-		// Wait a moment for process to initialize
-		await new Promise((resolve) => setTimeout(resolve, 100));
-
-		if (this.exitError || this.process.exitCode !== null || this.process.signalCode !== null) {
-			const error = this.exitError ?? this.createProcessExitError(this.process.exitCode, this.process.signalCode);
-			this.exitError = error;
-			throw error;
+		if (childProcess.exitCode !== null || childProcess.signalCode !== null) {
+			this.closeTransport(this.createProcessExitError(childProcess.exitCode, childProcess.signalCode));
 		}
+		await ready;
 	}
 
 	/**
@@ -207,6 +223,7 @@ export class RpcClient {
 
 	private async stopProcess(childProcess: ChildProcess): Promise<void> {
 		this.stopping = true;
+		this.rejectPendingStart(new Error("RPC client stopped"));
 		this.cancelActiveHostRequests(HOST_FAILURE_STOPPING);
 
 		try {
@@ -249,6 +266,13 @@ export class RpcClient {
 				? new Error("RPC client stopped")
 				: new Error(`Agent process stdout ended. Stderr: ${this.stderr}`),
 		);
+		try {
+			if (childProcess.stdin && !childProcess.stdin.destroyed && !childProcess.stdin.writableEnded) {
+				childProcess.stdin.end();
+			}
+		} catch {
+			// Transport is already terminal; process containment remains stop()'s responsibility.
+		}
 	}
 
 	private waitForProcessExit(childProcess: ChildProcess, timeoutMs?: number): Promise<boolean> {
@@ -616,6 +640,15 @@ export class RpcClient {
 		try {
 			const data: unknown = JSON.parse(line);
 
+			if (typeof data === "object" && data !== null && "type" in data && data.type === "rpc_ready") {
+				if (isRpcReadyMessage(data) && this.pendingStart && !this.stopping && !this.exitError) {
+					const pendingStart = this.pendingStart;
+					this.pendingStart = null;
+					pendingStart.resolve();
+				}
+				return;
+			}
+
 			if (typeof data === "object" && data !== null && "type" in data && data.type === "extension_host_request") {
 				void this.handleHostRequest(data, Buffer.byteLength(line) + 1).catch(() => {
 					this.writeMalformedRequestFailure(data);
@@ -774,8 +807,16 @@ export class RpcClient {
 	private closeTransport(error: Error): void {
 		const terminalError = this.exitError ?? error;
 		this.exitError = terminalError;
+		this.rejectPendingStart(terminalError);
 		this.cancelActiveHostRequests();
 		this.rejectPendingRequests(terminalError);
+	}
+
+	private rejectPendingStart(error: Error): void {
+		const pendingStart = this.pendingStart;
+		if (!pendingStart) return;
+		this.pendingStart = null;
+		pendingStart.reject(error);
 	}
 
 	private createProcessExitError(code: number | null, signal: NodeJS.Signals | null): Error {

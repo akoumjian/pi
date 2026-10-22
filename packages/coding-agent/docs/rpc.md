@@ -1373,6 +1373,22 @@ Dismiss any dialog method. The extension receives `undefined` (for select/input/
 {"type": "extension_ui_response", "id": "uuid-3", "cancelled": true}
 ```
 
+## RPC Lifecycle and Readiness
+
+RPC mode has four lifecycle states: `STARTING → READY → CLOSING → CLOSED`.
+
+During `STARTING`, Pi processes only correlated `extension_host_response` and `extension_ui_response` records needed by asynchronous extension `session_start` handlers. Every ordinary command received before readiness gets exactly one correlated failure with `RPC session is not ready`; it is never buffered or executed later. After rebind and all `session_start` handlers complete, Pi emits exactly one strict readiness record:
+
+```json
+{"type":"rpc_ready"}
+```
+
+`RpcClient.start()` waits for that exact record rather than sleeping for a fixed interval. Extension host requests continue to dispatch while it waits. Startup rejects if the process exits, stdout ends, the transport fails, or `stop()` begins before readiness.
+
+In `READY`, ordinary commands dispatch concurrently. This keeps state queries, abort commands, and reentrant host callbacks responsive while another command is long-running.
+
+EOF, explicit stop, signal, or extension shutdown transitions immediately to `CLOSING`, revokes host/UI requests, detaches input, discards unread work, and joins one idempotent runtime-disposal path. No ordinary command is admitted after closing begins, including commands received during startup. In-flight commands may be interrupted; callers that need completion must keep stdin open and wait for their correlated response. `session_shutdown` gets one cleanup opportunity, after which the process enters `CLOSED`. A signal received during cleanup supplies the final signal exit status without starting a second cleanup.
+
 ## Extension Host Request Protocol
 
 RPC-mode extensions can make bounded, service-neutral requests to the embedding host with `pi.requestHost()`. This is separate from extension UI: it carries application data, has correlated success/failure responses, and is unavailable outside RPC mode.
@@ -1425,7 +1441,7 @@ const client = new RpcClient({
 
 Handler results must be JSON-compatible. Missing handlers, thrown errors, invalid results, oversized results, malformed requests, duplicate IDs, and request-limit failures become fixed, bounded categories. Raw handler exceptions, provider bodies, and other thrown text are never returned to the guest. Handler signals are aborted when the child process exits, stdout reaches EOF, or the client stops.
 
-`RpcClient.stop()` first revokes active handler authority and writes bounded cancellation failures while child stdin is still writable. It then closes stdin so Pi can run `session_shutdown` and dispose session-owned work. If EOF arrives during asynchronous `session_start`, Pi immediately rejects pending host/UI requests, lets startup finish, concurrently dispatches every command received before EOF (including a final record without LF), awaits that fixed startup set, and only then runs `session_shutdown`. After startup, commands retain the baseline concurrent dispatch behavior, so state, abort, and host-callback traffic is not blocked behind a long command; EOF begins shutdown immediately and disposal aborts in-flight work. Concurrent EOF, signal, and extension shutdown requests join one cleanup operation, and a signal received during cleanup supplies the final signal exit status without truncating `session_shutdown`. If the child does not exit within five seconds, the client sends `SIGTERM`; after one more second it sends `SIGKILL`. The stop promise still waits for the actual child `exit` event after `SIGKILL`; a child `error` event alone does not prove exit.
+`RpcClient.stop()` first rejects a pending readiness wait, revokes active handler authority, and writes bounded host-request cancellation failures while child stdin is still writable. It then closes stdin so Pi immediately enters `CLOSING`, runs the single `session_shutdown`/runtime-disposal path, and interrupts in-flight commands. If the child does not exit within five seconds, the client sends `SIGTERM`; after one more second it sends `SIGKILL`. TERM/KILL are client-side containment fallbacks only; the stop promise still waits for the actual child `exit` event after `SIGKILL`, and a child `error` event alone does not prove exit.
 
 ## Error Handling
 

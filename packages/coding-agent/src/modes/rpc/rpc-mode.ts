@@ -9,6 +9,7 @@
  * - Responses: JSON objects with `type: "response"`, `command`, `success`, and optional `data`/`error`
  * - Events: AgentSessionEvent objects streamed as they occur
  * - Extension UI: Extension UI requests are emitted, client responds with extension_ui_response
+ * - Lifecycle: exactly one rpc_ready record is emitted after startup before ordinary commands are accepted
  */
 
 import * as crypto from "node:crypto";
@@ -35,6 +36,7 @@ import type {
 	RpcCommand,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcReadyMessage,
 	RpcResponse,
 	RpcSessionState,
 	RpcSlashCommand,
@@ -47,9 +49,13 @@ export type {
 	RpcExtensionHostResponse,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcReadyMessage,
 	RpcResponse,
 	RpcSessionState,
 } from "./rpc-types.ts";
+
+type RpcLifecycleState = "starting" | "ready" | "closing" | "closed";
+const RPC_NOT_READY_ERROR = "RPC session is not ready";
 
 /**
  * Run in RPC mode.
@@ -73,7 +79,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
 
-	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
+	const output = (obj: RpcResponse | RpcExtensionUIRequest | RpcReadyMessage | object) => {
 		writeRawStdout(serializeJsonLine(obj));
 	};
 	const hostTransport = new RpcExtensionHostTransport((line) => {
@@ -101,8 +107,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		{ resolve: (value: any) => void; reject: (error: Error) => void }
 	>();
 
-	// Shutdown request flag
-	let shutdownRequested = false;
+	let lifecycleState: RpcLifecycleState = "starting";
+	const isClosing = (): boolean => lifecycleState === "closing" || lifecycleState === "closed";
 	let shutdownPromise: Promise<void> | undefined;
 	let shutdownExitCode = 0;
 	let shutdownSignal: NodeJS.Signals | undefined;
@@ -381,20 +387,18 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				},
 			},
 			shutdownHandler: () => {
-				shutdownRequested = true;
+				void shutdown();
 			},
 			onError: (err) => {
 				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
 			},
 		});
 
+		if (isClosing()) return;
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
 			output(toJsonEvent(event));
-			if (event.type === "agent_settled") {
-				void checkShutdownRequested();
-			}
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
 			await waitForRawStdoutBackpressure();
@@ -754,14 +758,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 
-	/**
-	 * Check if shutdown was requested and perform shutdown if so.
-	 * Called after handling each command when waiting for the next command.
-	 */
 	let detachInput = () => {};
-	let inputReady = false;
-	let inputEnded = false;
-	const bufferedInputLines: string[] = [];
 
 	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
 		if (signal !== undefined) {
@@ -772,6 +769,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 		if (shutdownPromise) return shutdownPromise;
 
+		lifecycleState = "closing";
 		let resolveShutdown: () => void;
 		let rejectShutdown: (error: unknown) => void;
 		shutdownPromise = new Promise<void>((resolve, reject) => {
@@ -790,17 +788,13 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				try {
 					if (shutdownSignal !== "SIGTERM") await flushRawStdout();
 				} finally {
+					lifecycleState = "closed";
 					for (const cleanup of signalCleanupHandlers.splice(0)) cleanup();
 					exit(shutdownExitCode);
 				}
 			}
 		})().then(resolveShutdown!, rejectShutdown!);
 		return shutdownPromise;
-	}
-
-	async function checkShutdownRequested(): Promise<void> {
-		if (!shutdownRequested) return;
-		await shutdown();
 	}
 
 	const handleExtensionResponse = (parsed: unknown, line: string): boolean => {
@@ -819,6 +813,14 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			return true;
 		}
 		return false;
+	};
+
+	const rejectCommandBeforeReady = (parsed: unknown): void => {
+		const record = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
+		const id = typeof record?.id === "string" ? record.id : undefined;
+		const command = typeof record?.type === "string" ? record.type : "unknown";
+		output(error(id, command, RPC_NOT_READY_ERROR));
+		void waitForRawStdoutBackpressure();
 	};
 
 	const handleInputLine = async (line: string) => {
@@ -846,7 +848,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				output(response);
 				await waitForRawStdoutBackpressure();
 			}
-			await checkShutdownRequested();
 		} catch (commandError: unknown) {
 			output(
 				error(
@@ -860,26 +861,27 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	};
 
 	const onInputEnd = () => {
-		if (inputEnded) return;
-		inputEnded = true;
-		closeInputRequests(new Error("RPC connection closed"));
-		if (inputReady) void shutdown();
+		void shutdown();
 	};
 
 	detachInput = (() => {
 		const detachJsonl = attachJsonlLineReader(input, (line) => {
+			if (isClosing()) return;
+			let parsed: unknown;
 			try {
-				if (handleExtensionResponse(JSON.parse(line), line)) return;
+				parsed = JSON.parse(line);
 			} catch {
-				// Preserve malformed input for normal parse-error handling.
-			}
-			if (inputReady) {
 				void handleInputLine(line);
 				return;
 			}
-			bufferedInputLines.push(line);
+			if (handleExtensionResponse(parsed, line)) return;
+			if (lifecycleState === "starting") {
+				rejectCommandBeforeReady(parsed);
+				return;
+			}
+			void handleInputLine(line);
 		});
-		// Register after the reader so its final unterminated line is enqueued before EOF shutdown begins.
+		// Register after the reader so its final unterminated line is classified before EOF shutdown.
 		input.on("end", onInputEnd);
 		return () => {
 			detachJsonl();
@@ -888,13 +890,17 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	})();
 
 	registerSignalHandlers();
-	await rebindSession();
-	const startupDrain = bufferedInputLines.splice(0).map((line) => handleInputLine(line));
-	inputReady = true;
-	if (inputEnded) {
-		await Promise.allSettled(startupDrain);
-		await shutdown();
+	try {
+		await rebindSession();
+	} catch (startupError) {
+		if (!isClosing()) throw startupError;
 	}
+	if (lifecycleState !== "starting") {
+		await shutdownPromise?.catch(() => {});
+		return new Promise(() => {});
+	}
+	lifecycleState = "ready";
+	output({ type: "rpc_ready" });
 
 	// Keep process alive forever
 	return new Promise(() => {});

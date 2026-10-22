@@ -180,6 +180,7 @@ async function startRpcMode(options: { withAuth: boolean; responseDelayMs: numbe
 	const { runtimeHost, cleanup } = await createRuntimeHost(options);
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+	await vi.waitFor(() => expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({ type: "rpc_ready" }));
 
 	return { lineHandler: rpcIo.lineHandler!, cleanup };
 }

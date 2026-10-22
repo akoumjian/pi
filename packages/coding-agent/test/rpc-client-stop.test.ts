@@ -26,6 +26,7 @@ describe("RpcClient graceful stop", () => {
 	it("closes stdin and lets the child exit cleanly before signaling", async () => {
 		const { dir, path } = writeChildScript(`
 import { writeFileSync } from "node:fs";
+process.stdout.write(JSON.stringify({ type: "rpc_ready" }) + "\\n");
 process.on("SIGTERM", () => {
   writeFileSync(process.env.MARKER, "sigterm");
   process.exit(143);

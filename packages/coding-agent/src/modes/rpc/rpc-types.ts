@@ -109,6 +109,15 @@ export interface RpcSessionState {
 }
 
 // ============================================================================
+// RPC Lifecycle (stdout)
+// ============================================================================
+
+/** Emitted exactly once after RPC session startup is complete and input is accepted. */
+export interface RpcReadyMessage {
+	type: "rpc_ready";
+}
+
+// ============================================================================
 // RPC Responses (stdout)
 // ============================================================================
 
