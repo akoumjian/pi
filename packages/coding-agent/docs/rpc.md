@@ -1398,8 +1398,8 @@ Host to extension (stdin), failure:
 The request contract is intentionally narrow:
 
 - Service names must match `^[a-z][a-z0-9._-]{0,127}$`.
-- Correlation IDs are UUIDs and cannot exceed 128 bytes.
-- `payload` and successful response `data` must be bounded JSON-compatible values. Validation is iterative and limited to 64 levels and 65,536 visited values; cyclic/repeated references, sparse arrays, accessors, symbol keys, exotic prototypes, proxies that fail inspection, non-finite numbers, and unsupported JavaScript values are rejected.
+- Correlation IDs are UUIDs and cannot exceed 128 bytes. Request and response envelopes are strict: required fields must be present, field types and literals must match exactly, and additional properties are rejected without coercion.
+- `payload` and successful response `data` must be bounded JSON-compatible values. Validation is iterative and limited to 64 levels and 65,536 visited values; cycles, sparse arrays, accessors, symbol keys, exotic prototypes, proxies, non-finite numbers, and unsupported JavaScript values are rejected.
 - Each serialized request or response line is limited to 256 KiB.
 - An RPC process can have at most 16 pending extension host requests.
 - Extension requests default to a 30-second timeout. A caller can select a positive integer timeout up to 120 seconds and can provide an `AbortSignal`.
@@ -1407,6 +1407,7 @@ The request contract is intentionally narrow:
 - Unknown and late responses do not affect another request. A duplicate active request ID is a protocol error: the original handler is aborted and retired, exactly one failure is emitted for that ID, and its later completion is suppressed.
 - A malformed matched response rejects only its corresponding extension promise. A deeply nested response cannot terminate the RPC input loop.
 - Pending requests are rejected when the RPC transport closes. Child stdout EOF is a terminal transport boundary even if the child has not emitted `exit` yet.
+- Shared acyclic object references are accepted and serialize as ordinary duplicated JSON values; actual cycles are rejected.
 
 `RpcClient` dispatches requests by exact service name:
 
@@ -1424,7 +1425,7 @@ const client = new RpcClient({
 
 Handler results must be JSON-compatible. Missing handlers, thrown errors, invalid results, oversized results, malformed requests, duplicate IDs, and request-limit failures become fixed, bounded categories. Raw handler exceptions, provider bodies, and other thrown text are never returned to the guest. Handler signals are aborted when the child process exits, stdout reaches EOF, or the client stops.
 
-`RpcClient.stop()` first revokes active handler authority and writes bounded cancellation failures while child stdin is still writable. It then closes stdin so Pi can run `session_shutdown` and dispose session-owned work. If the child does not exit within five seconds, the client sends `SIGTERM`; after one more second it sends `SIGKILL`. The stop promise still waits for the actual child `exit` event after `SIGKILL`; a child `error` event alone does not prove exit.
+`RpcClient.stop()` first revokes active handler authority and writes bounded cancellation failures while child stdin is still writable. It then closes stdin so Pi can run `session_shutdown` and dispose session-owned work. If EOF arrives during asynchronous `session_start`, Pi immediately rejects pending host/UI requests, lets startup finish, processes every command received before EOF (including a final record without LF), and only then runs `session_shutdown`. If the child does not exit within five seconds, the client sends `SIGTERM`; after one more second it sends `SIGKILL`. The stop promise still waits for the actual child `exit` event after `SIGKILL`; a child `error` event alone does not prove exit.
 
 ## Error Handling
 

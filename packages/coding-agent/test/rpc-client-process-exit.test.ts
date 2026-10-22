@@ -36,6 +36,32 @@ process.stdin.resume();
 		await expect(client.getCommands()).rejects.toThrow(/Agent process (?:stdout ended|exited)/);
 	});
 
+	test("resolves a trailing response without LF before stdout EOF cleanup", async () => {
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+let input = "";
+process.stdin.on("data", (chunk) => {
+  input += chunk;
+  const newline = input.indexOf("\\n");
+  if (newline === -1) return;
+  const command = JSON.parse(input.slice(0, newline));
+  process.stdout.end(JSON.stringify({
+    id: command.id,
+    type: "response",
+    command: "get_commands",
+    success: true,
+    data: { commands: [] }
+  }));
+});
+process.stdin.resume();
+`),
+		});
+
+		await client.start();
+		await expect(client.getCommands()).resolves.toEqual([]);
+		await client.stop();
+	});
+
 	test("deterministically aborts active host handlers when the child exits", async () => {
 		for (let iteration = 0; iteration < 10; iteration++) {
 			let observeAbort: (() => void) | undefined;

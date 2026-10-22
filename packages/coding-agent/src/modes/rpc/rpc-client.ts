@@ -14,6 +14,7 @@ import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.t
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import {
 	isJsonValue,
+	isRpcExtensionHostRequest,
 	isRpcHostCorrelationId,
 	isRpcHostService,
 	RPC_HOST_MAX_LINE_BYTES,
@@ -42,6 +43,7 @@ type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
 
 interface ActiveHostRequest {
 	controller: AbortController;
+	retired: boolean;
 }
 
 const HOST_FAILURE_DUPLICATE_ID = "Duplicate extension host request id";
@@ -106,6 +108,7 @@ export class RpcClient {
 	private options: RpcClientOptions;
 	private hostRequestHandlers = new Map<string, RpcHostRequestHandler>();
 	private activeHostRequests = new Map<string, ActiveHostRequest>();
+	private activeHostExecutions = 0;
 	private stopping = false;
 	private stopPromise: Promise<void> | null = null;
 
@@ -169,12 +172,11 @@ export class RpcClient {
 			if (this.process !== childProcess) return;
 			this.closeTransport(new Error(`Agent process stdin error: ${error.message}. Stderr: ${this.stderr}`));
 		});
-		childProcess.stdout?.once("end", () => this.onStdoutEnd(childProcess));
-
-		// Set up strict JSONL reader for stdout.
+		// Register the JSONL reader first so it emits a trailing unterminated line before EOF cleanup.
 		this.stopReadingStdout = attachJsonlLineReader(childProcess.stdout!, (line) => {
 			this.handleLine(line);
 		});
+		childProcess.stdout?.once("end", () => this.onStdoutEnd(childProcess));
 
 		// Wait a moment for process to initialize
 		await new Promise((resolve) => setTimeout(resolve, 100));
@@ -649,6 +651,7 @@ export class RpcClient {
 	private async handleHostRequest(value: unknown, lineBytes: number): Promise<void> {
 		let id: string | undefined;
 		let active: ActiveHostRequest | undefined;
+		let handlerExecutionStarted = false;
 		try {
 			if (this.stopping || this.exitError) return;
 			if (typeof value !== "object" || value === null || !("id" in value)) return;
@@ -657,24 +660,20 @@ export class RpcClient {
 
 			const duplicate = this.activeHostRequests.get(id);
 			if (duplicate) {
-				this.retireHostRequest(id, duplicate);
-				this.writeHostFailure(id, HOST_FAILURE_DUPLICATE_ID);
+				if (this.retireHostRequest(duplicate)) {
+					this.writeHostFailure(id, HOST_FAILURE_DUPLICATE_ID);
+				}
 				return;
 			}
-			if (lineBytes > RPC_HOST_MAX_LINE_BYTES) {
+			if (lineBytes > RPC_HOST_MAX_LINE_BYTES || !isRpcExtensionHostRequest(value)) {
 				this.writeHostFailure(id, HOST_FAILURE_MALFORMED_REQUEST);
 				return;
 			}
-			if (
-				!("service" in value) ||
-				!isRpcHostService(value.service) ||
-				!("payload" in value) ||
-				!isJsonValue(value.payload)
-			) {
+			if (!isJsonValue(value.payload)) {
 				this.writeHostFailure(id, HOST_FAILURE_MALFORMED_REQUEST);
 				return;
 			}
-			if (this.activeHostRequests.size >= RPC_HOST_MAX_PENDING_REQUESTS) {
+			if (this.activeHostExecutions >= RPC_HOST_MAX_PENDING_REQUESTS) {
 				this.writeHostFailure(id, HOST_FAILURE_REQUEST_LIMIT);
 				return;
 			}
@@ -686,8 +685,10 @@ export class RpcClient {
 				return;
 			}
 
-			active = { controller: new AbortController() };
+			active = { controller: new AbortController(), retired: false };
 			this.activeHostRequests.set(id, active);
+			this.activeHostExecutions++;
+			handlerExecutionStarted = true;
 			let data: JsonValue;
 			try {
 				data = await handler(request.payload, {
@@ -696,10 +697,10 @@ export class RpcClient {
 					signal: active.controller.signal,
 				});
 			} catch {
-				if (!active.controller.signal.aborted) this.writeHostFailure(id, HOST_FAILURE_HANDLER);
+				if (!active.retired) this.writeHostFailure(id, HOST_FAILURE_HANDLER);
 				return;
 			}
-			if (active.controller.signal.aborted) return;
+			if (active.retired) return;
 			if (!isJsonValue(data)) {
 				this.writeHostFailure(id, HOST_FAILURE_INVALID_RESPONSE);
 				return;
@@ -711,10 +712,12 @@ export class RpcClient {
 			}
 		} catch {
 			if (id !== undefined && !this.stopping && !this.exitError) {
-				if (active) this.retireHostRequest(id, active);
-				this.writeHostFailure(id, HOST_FAILURE_MALFORMED_REQUEST);
+				if (!active || this.retireHostRequest(active)) {
+					this.writeHostFailure(id, HOST_FAILURE_MALFORMED_REQUEST);
+				}
 			}
 		} finally {
+			if (handlerExecutionStarted) this.activeHostExecutions--;
 			if (id !== undefined && active && this.activeHostRequests.get(id) === active) {
 				this.activeHostRequests.delete(id);
 			}
@@ -755,15 +758,16 @@ export class RpcClient {
 		stdin.write(serializeRpcHostMessage(response));
 	}
 
-	private retireHostRequest(id: string, active: ActiveHostRequest): void {
-		if (this.activeHostRequests.get(id) === active) this.activeHostRequests.delete(id);
+	private retireHostRequest(active: ActiveHostRequest): boolean {
+		if (active.retired) return false;
+		active.retired = true;
 		active.controller.abort();
+		return true;
 	}
 
 	private cancelActiveHostRequests(error?: string): void {
-		for (const [id, active] of [...this.activeHostRequests]) {
-			this.retireHostRequest(id, active);
-			if (error !== undefined) this.writeHostFailure(id, error);
+		for (const [id, active] of this.activeHostRequests) {
+			if (this.retireHostRequest(active) && error !== undefined) this.writeHostFailure(id, error);
 		}
 	}
 

@@ -54,8 +54,15 @@ describe("RPC extension host transport", () => {
 		const cyclic: Record<string, unknown> = {};
 		cyclic.self = cyclic;
 		await expect(transport.request("valid", cyclic as never)).rejects.toThrow("JSON-compatible");
-		const repeated = {};
-		await expect(transport.request("valid", [repeated, repeated] as never)).rejects.toThrow("JSON-compatible");
+		const shared = { value: 1 };
+		const sharedRequest = transport.request("valid", { left: shared, right: shared });
+		const sharedEnvelope = requestFrom(lines[0]);
+		expect(sharedEnvelope.payload).toEqual({ left: { value: 1 }, right: { value: 1 } });
+		transport.handleResponse(
+			{ type: "extension_host_response", id: sharedEnvelope.id, success: true, data: null },
+			100,
+		);
+		await expect(sharedRequest).resolves.toBeNull();
 		await expect(transport.request("valid", Number.NaN as never)).rejects.toThrow("JSON-compatible");
 		await expect(transport.request("valid", new Date() as never)).rejects.toThrow("JSON-compatible");
 		await expect(transport.request("valid", { [Symbol("hidden")]: true } as never)).rejects.toThrow(
@@ -139,13 +146,39 @@ describe("RPC extension host transport", () => {
 		}
 	});
 
+	it("rejects strict-envelope violations without coercion or cross-request effects", async () => {
+		const lines: string[] = [];
+		const transport = new RpcExtensionHostTransport((line) => lines.push(line));
+		const invalidResponses = [
+			{ type: "extension_host_response", success: "true", data: null },
+			{ type: "extension_host_response", success: true, data: null, extra: true },
+			{ type: "extension_host_response", success: false, error: "failed", data: null },
+			{ type: "extension_host_response", success: true },
+		];
+
+		for (const [index, invalid] of invalidResponses.entries()) {
+			const request = transport.request(`strict.${index}`, null);
+			const id = requestFrom(lines[index]).id;
+			expect(transport.handleResponse({ ...invalid, id }, 100)).toBe(true);
+			await expect(request).rejects.toThrow("Malformed host response");
+		}
+
+		const valid = transport.request("strict.valid", null);
+		const validId = requestFrom(lines[invalidResponses.length]).id;
+		transport.handleResponse(
+			{ type: "extension_host_response", id: validId, success: true, data: { accepted: true } },
+			100,
+		);
+		await expect(valid).resolves.toEqual({ accepted: true });
+	});
+
 	it("rejects malformed and oversized matched responses and ignores unknown or duplicate replies", async () => {
 		const lines: string[] = [];
 		const transport = new RpcExtensionHostTransport((line) => lines.push(line));
 		const malformed = transport.request("malformed", null);
 		const malformedId = requestFrom(lines[0]).id;
 		expect(transport.handleResponse({ id: malformedId, success: true }, 100)).toBe(true);
-		await expect(malformed).rejects.toThrow("Malformed host response data");
+		await expect(malformed).rejects.toThrow("Malformed host response");
 
 		const deeplyNested = transport.request("deep", null);
 		const deeplyNestedId = requestFrom(lines[1]).id;
@@ -201,6 +234,6 @@ describe("RPC extension host transport", () => {
 				100,
 			),
 		).toBe(true);
-		await expect(error).rejects.toThrow("error exceeds 2048 bytes");
+		await expect(error).rejects.toThrow("Malformed host response");
 	});
 });

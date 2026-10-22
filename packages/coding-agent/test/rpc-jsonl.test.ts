@@ -46,6 +46,25 @@ describe("RPC JSONL framing", () => {
 		expect(lines).toEqual(['{"a":1}', '{"b":2}']);
 	});
 
+	test("emits a trailing final line before later end listeners run", async () => {
+		const events: string[] = [];
+		const stream = Readable.from([Buffer.from('{"final":true}')]);
+
+		attachJsonlLineReader(stream, (line) => {
+			events.push(`line:${line}`);
+		});
+		const done = new Promise<void>((resolve) => {
+			stream.on("end", () => {
+				events.push("end");
+				resolve();
+			});
+		});
+
+		await done;
+
+		expect(events).toEqual(['line:{"final":true}', "end"]);
+	});
+
 	test("emits a final line without trailing LF", async () => {
 		const lines: string[] = [];
 		const stream = Readable.from([Buffer.from('{"a":1}')]);

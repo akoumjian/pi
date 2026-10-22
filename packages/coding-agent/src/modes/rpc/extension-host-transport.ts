@@ -1,5 +1,8 @@
 import * as crypto from "node:crypto";
+import { isProxy } from "node:util/types";
 import type { JsonValue } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
+import { Compile } from "typebox/compile";
 import type { ExtensionHostRequestOptions } from "../../core/extensions/types.ts";
 import { serializeJsonLine } from "./jsonl.ts";
 import type { RpcExtensionHostRequest, RpcExtensionHostResponse } from "./rpc-types.ts";
@@ -13,27 +16,97 @@ export const RPC_HOST_MAX_ID_BYTES = 128;
 export const RPC_HOST_MAX_JSON_DEPTH = 64;
 export const RPC_HOST_MAX_JSON_NODES = 65_536;
 
-const SERVICE_PATTERN = /^[a-z][a-z0-9._-]{0,127}$/;
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const SERVICE_PATTERN_SOURCE = "^[a-z][a-z0-9._-]{0,127}$";
+const UUID_PATTERN_SOURCE =
+	"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$";
+
+const RpcHostServiceSchema = Type.String({ pattern: SERVICE_PATTERN_SOURCE, maxLength: 128 });
+const RpcHostCorrelationIdSchema = Type.String({ pattern: UUID_PATTERN_SOURCE, maxLength: RPC_HOST_MAX_ID_BYTES });
+const RpcExtensionHostRequestSchema = Type.Object(
+	{
+		type: Type.Literal("extension_host_request"),
+		id: RpcHostCorrelationIdSchema,
+		service: RpcHostServiceSchema,
+		payload: Type.Unknown(),
+	},
+	{ additionalProperties: false },
+);
+const RpcExtensionHostResponseSchema = Type.Union([
+	Type.Object(
+		{
+			type: Type.Literal("extension_host_response"),
+			id: RpcHostCorrelationIdSchema,
+			success: Type.Literal(true),
+			data: Type.Unknown(),
+		},
+		{ additionalProperties: false },
+	),
+	Type.Object(
+		{
+			type: Type.Literal("extension_host_response"),
+			id: RpcHostCorrelationIdSchema,
+			success: Type.Literal(false),
+			error: Type.String({ maxLength: RPC_HOST_MAX_ERROR_BYTES }),
+		},
+		{ additionalProperties: false },
+	),
+]);
+
+const validateRpcHostService = Compile(RpcHostServiceSchema);
+const validateRpcHostCorrelationId = Compile(RpcHostCorrelationIdSchema);
+const validateRpcExtensionHostRequest = Compile(RpcExtensionHostRequestSchema);
+const validateRpcExtensionHostResponse = Compile(RpcExtensionHostResponseSchema);
 
 export function isRpcHostService(value: unknown): value is string {
-	return typeof value === "string" && SERVICE_PATTERN.test(value);
+	try {
+		return validateRpcHostService.Check(value);
+	} catch {
+		return false;
+	}
 }
 
 export function isRpcHostCorrelationId(value: unknown): value is string {
-	return typeof value === "string" && Buffer.byteLength(value) <= RPC_HOST_MAX_ID_BYTES && UUID_PATTERN.test(value);
+	try {
+		return validateRpcHostCorrelationId.Check(value);
+	} catch {
+		return false;
+	}
 }
+
+export function isRpcExtensionHostRequest(value: unknown): value is RpcExtensionHostRequest {
+	try {
+		return validateRpcExtensionHostRequest.Check(value);
+	} catch {
+		return false;
+	}
+}
+
+export function isRpcExtensionHostResponse(value: unknown): value is RpcExtensionHostResponse {
+	try {
+		return validateRpcExtensionHostResponse.Check(value);
+	} catch {
+		return false;
+	}
+}
+
+type JsonTraversalEntry = { phase: "enter"; value: unknown; depth: number } | { phase: "exit"; value: object };
 
 export function isJsonValue(value: unknown): value is JsonValue {
 	try {
-		const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
-		const seen = new Set<object>();
-		let visited = 0;
+		const pending: JsonTraversalEntry[] = [{ phase: "enter", value, depth: 0 }];
+		const activeAncestors = new Set<object>();
+		let scheduledNodes = 1;
+		let visitedNodes = 0;
 
 		while (pending.length > 0) {
 			const current = pending.pop()!;
-			visited++;
-			if (visited > RPC_HOST_MAX_JSON_NODES) return false;
+			if (current.phase === "exit") {
+				activeAncestors.delete(current.value);
+				continue;
+			}
+
+			visitedNodes++;
+			if (visitedNodes > RPC_HOST_MAX_JSON_NODES) return false;
 
 			const currentValue = current.value;
 			if (currentValue === null || typeof currentValue === "string" || typeof currentValue === "boolean") {
@@ -44,8 +117,9 @@ export function isJsonValue(value: unknown): value is JsonValue {
 				continue;
 			}
 			if (typeof currentValue !== "object" || current.depth >= RPC_HOST_MAX_JSON_DEPTH) return false;
-			if (seen.has(currentValue)) return false;
-			seen.add(currentValue);
+			if (isProxy(currentValue) || activeAncestors.has(currentValue)) return false;
+			activeAncestors.add(currentValue);
+			pending.push({ phase: "exit", value: currentValue });
 
 			const keys = Reflect.ownKeys(currentValue);
 			if (Array.isArray(currentValue)) {
@@ -55,7 +129,9 @@ export function isJsonValue(value: unknown): value is JsonValue {
 					return false;
 				}
 				const length = lengthDescriptor.value;
-				if (!Number.isSafeInteger(length) || length < 0 || length > RPC_HOST_MAX_JSON_NODES - visited) return false;
+				if (!Number.isSafeInteger(length) || length < 0 || length > RPC_HOST_MAX_JSON_NODES - scheduledNodes) {
+					return false;
+				}
 				let indices = 0;
 				for (const key of keys) {
 					if (key === "length") continue;
@@ -64,22 +140,24 @@ export function isJsonValue(value: unknown): value is JsonValue {
 					if (!Number.isSafeInteger(index) || index < 0 || index >= length) return false;
 					const descriptor = Object.getOwnPropertyDescriptor(currentValue, key);
 					if (!descriptor?.enumerable || !("value" in descriptor)) return false;
-					pending.push({ value: descriptor.value, depth: current.depth + 1 });
+					pending.push({ phase: "enter", value: descriptor.value, depth: current.depth + 1 });
 					indices++;
 				}
 				if (indices !== length) return false;
+				scheduledNodes += length;
 				continue;
 			}
 
 			const prototype = Object.getPrototypeOf(currentValue);
 			if (prototype !== Object.prototype && prototype !== null) return false;
-			if (keys.length > RPC_HOST_MAX_JSON_NODES - visited) return false;
+			if (keys.length > RPC_HOST_MAX_JSON_NODES - scheduledNodes) return false;
 			for (const key of keys) {
 				if (typeof key !== "string") return false;
 				const descriptor = Object.getOwnPropertyDescriptor(currentValue, key);
 				if (!descriptor?.enumerable || !("value" in descriptor)) return false;
-				pending.push({ value: descriptor.value, depth: current.depth + 1 });
+				pending.push({ phase: "enter", value: descriptor.value, depth: current.depth + 1 });
 			}
+			scheduledNodes += keys.length;
 		}
 		return true;
 	} catch {
@@ -259,20 +337,16 @@ export class RpcExtensionHostTransport {
 				pending.reject(new Error(`RPC host response exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`));
 				return true;
 			}
-			if (!("success" in value) || typeof value.success !== "boolean") {
+			if (!isRpcExtensionHostResponse(value)) {
 				pending.reject(new Error("Malformed host response"));
 				return true;
 			}
 			if (value.success) {
-				if (!("data" in value) || !isJsonValue(value.data)) {
+				if (!isJsonValue(value.data)) {
 					pending.reject(new Error("Malformed host response data"));
 					return true;
 				}
 				pending.resolve(value.data);
-				return true;
-			}
-			if (!("error" in value) || typeof value.error !== "string") {
-				pending.reject(new Error("Malformed host response error"));
 				return true;
 			}
 			if (Buffer.byteLength(value.error) > RPC_HOST_MAX_ERROR_BYTES) {
@@ -282,7 +356,7 @@ export class RpcExtensionHostTransport {
 			pending.reject(new Error(value.error));
 			return true;
 		} catch {
-			pending?.reject(new Error("Malformed host response data"));
+			pending?.reject(new Error("Malformed host response"));
 			return pending !== undefined;
 		}
 	}

@@ -135,6 +135,29 @@ describe("RpcClient extension host requests", () => {
 		expect(JSON.stringify(responses)).not.toContain(secret);
 	});
 
+	it("rejects strict request-envelope violations without coercion", async () => {
+		const handler = vi.fn(() => null);
+		const client = new RpcClient({ hostRequestHandlers: { work: handler } });
+		const { responses } = createFakeProcess(client);
+		const privateClient = client as unknown as RpcClientPrivate;
+		const invalidRequests = [
+			{ service: 1, payload: null },
+			{ service: "work" },
+			{ service: "work", payload: null, extra: true },
+			{ service: `work${"x".repeat(128)}`, payload: null },
+		];
+
+		for (const request of invalidRequests) {
+			privateClient.handleLine(
+				JSON.stringify({ type: "extension_host_request", id: crypto.randomUUID(), ...request }),
+			);
+		}
+
+		await vi.waitFor(() => expect(responses).toHaveLength(invalidRequests.length));
+		expect(responses.map(errorOf)).toEqual(invalidRequests.map(() => "Malformed extension host request"));
+		expect(handler).not.toHaveBeenCalled();
+	});
+
 	it("rejects deeply nested malformed requests without terminating later dispatch", async () => {
 		const handler = vi.fn(() => ({ ok: true }));
 		const client = new RpcClient({ hostRequestHandlers: { work: handler } });
@@ -152,22 +175,26 @@ describe("RpcClient extension host requests", () => {
 		expect(handler).toHaveBeenCalledOnce();
 	});
 
-	it("rejects a deeply nested matched handler result without disturbing other requests", async () => {
+	it("rejects a deeply nested result while serializing a shared DAG and later request", async () => {
+		const shared = { value: 1 };
 		const client = new RpcClient({
 			hostRequestHandlers: {
 				deep: () => nestedArray(3000) as never,
+				shared: () => ({ left: shared, right: shared }),
 				valid: () => ({ ok: true }),
 			},
 		});
 		const { responses } = createFakeProcess(client);
 		const privateClient = client as unknown as RpcClientPrivate;
 		privateClient.handleLine(hostRequest(crypto.randomUUID(), "deep", null));
+		privateClient.handleLine(hostRequest(crypto.randomUUID(), "shared", null));
 		privateClient.handleLine(hostRequest(crypto.randomUUID(), "valid", null));
 
-		await vi.waitFor(() => expect(responses).toHaveLength(2));
-		expect(responses.map((response) => (response.success ? "ok" : response.error))).toEqual([
+		await vi.waitFor(() => expect(responses).toHaveLength(3));
+		expect(responses.map((response) => (response.success ? response.data : response.error))).toEqual([
 			"Invalid host handler response",
-			"ok",
+			{ left: { value: 1 }, right: { value: 1 } },
+			{ ok: true },
 		]);
 	});
 
@@ -199,6 +226,46 @@ describe("RpcClient extension host requests", () => {
 		await flushAsyncHandler();
 		expect(responses).toHaveLength(1);
 		expect(handler).toHaveBeenCalledOnce();
+	});
+
+	it("caps actual handler executions after duplicate retirement until ignored aborts settle", async () => {
+		const resolvers: Array<() => void> = [];
+		let running = 0;
+		let maxRunning = 0;
+		const handler = vi.fn(
+			() =>
+				new Promise<null>((resolve) => {
+					running++;
+					maxRunning = Math.max(maxRunning, running);
+					resolvers.push(() => {
+						running--;
+						resolve(null);
+					});
+				}),
+		);
+		const client = new RpcClient({ hostRequestHandlers: { hold: handler } });
+		const { responses } = createFakeProcess(client);
+		const privateClient = client as unknown as RpcClientPrivate;
+
+		for (let index = 0; index < RPC_HOST_MAX_PENDING_REQUESTS + 4; index++) {
+			const id = crypto.randomUUID();
+			privateClient.handleLine(hostRequest(id, "hold", null));
+			privateClient.handleLine(hostRequest(id, "hold", null));
+		}
+
+		await vi.waitFor(() => expect(responses.length).toBeGreaterThanOrEqual(RPC_HOST_MAX_PENDING_REQUESTS + 4));
+		expect(handler).toHaveBeenCalledTimes(RPC_HOST_MAX_PENDING_REQUESTS);
+		expect(maxRunning).toBe(RPC_HOST_MAX_PENDING_REQUESTS);
+		const errors = responses.map(errorOf);
+		expect(errors.filter((error) => error === "Duplicate extension host request id")).toHaveLength(
+			RPC_HOST_MAX_PENDING_REQUESTS,
+		);
+		expect(errors.filter((error) => error === "Host request limit exceeded").length).toBeGreaterThanOrEqual(4);
+
+		const responseCount = responses.length;
+		for (const resolve of resolvers) resolve();
+		await flushAsyncHandler();
+		expect(responses).toHaveLength(responseCount);
 	});
 
 	it("enforces the active request bound with a stable failure", async () => {

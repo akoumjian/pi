@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import type { Readable } from "node:stream";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
 import type {
 	ExtensionUIContext,
@@ -54,8 +55,15 @@ export type {
  * Run in RPC mode.
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
-export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<never> {
+export interface RpcModeOptions {
+	input?: Readable;
+	exit?: (exitCode: number) => void;
+}
+
+export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcModeOptions = {}): Promise<never> {
 	takeOverStdout();
+	const input = options.input ?? process.stdin;
+	const exit = options.exit ?? process.exit;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
@@ -91,7 +99,15 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	// Shutdown request flag
 	let shutdownRequested = false;
 	let shuttingDown = false;
+	let inputClosedError: Error | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
+
+	function closeInputRequests(error: Error): void {
+		inputClosedError ??= error;
+		hostTransport.close(inputClosedError);
+		for (const pending of pendingExtensionRequests.values()) pending.reject(inputClosedError);
+		pendingExtensionRequests.clear();
+	}
 
 	/** Helper for dialog methods with signal/timeout support */
 	function createDialogPromise<T>(
@@ -100,6 +116,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		request: Record<string, unknown>,
 		parseResponse: (response: RpcExtensionUIResponse) => T,
 	): Promise<T> {
+		if (inputClosedError) return Promise.reject(inputClosedError);
 		if (opts?.signal?.aborted) return Promise.resolve(defaultValue);
 
 		const id = crypto.randomUUID();
@@ -130,7 +147,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 					cleanup();
 					resolve(parseResponse(response));
 				},
-				reject,
+				reject: (error) => {
+					cleanup();
+					reject(error);
+				},
 			});
 			output({ type: "extension_ui_request", id, ...request } as RpcExtensionUIRequest);
 		});
@@ -258,6 +278,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		},
 
 		async editor(title: string, prefill?: string): Promise<string | undefined> {
+			if (inputClosedError) return Promise.reject(inputClosedError);
 			const id = crypto.randomUUID();
 			return new Promise((resolve, reject) => {
 				pendingExtensionRequests.set(id, {
@@ -270,7 +291,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 							resolve(undefined);
 						}
 					},
-					reject,
+					reject: (error) => {
+						pendingExtensionRequests.delete(id);
+						reject(error);
+					},
 				});
 				output({ type: "extension_ui_request", id, method: "editor", title, prefill } as RpcExtensionUIRequest);
 			});
@@ -729,31 +753,25 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 */
 	let detachInput = () => {};
 	let inputReady = false;
+	let inputEnded = false;
+	let inputQueue = Promise.resolve();
 	const bufferedInputLines: string[] = [];
 
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
+	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
 		if (shuttingDown) {
-			process.exit(exitCode);
+			exit(exitCode);
+			return;
 		}
 		shuttingDown = true;
-		for (const cleanup of signalCleanupHandlers) {
-			cleanup();
-		}
+		for (const cleanup of signalCleanupHandlers) cleanup();
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
-		const shutdownError = new Error("RPC connection closed");
-		hostTransport.close(shutdownError);
-		for (const pending of pendingExtensionRequests.values()) {
-			pending.reject(shutdownError);
-		}
-		pendingExtensionRequests.clear();
+		closeInputRequests(new Error("RPC connection closed"));
 		await runtimeHost.dispose();
 		detachInput();
-		process.stdin.pause();
-		if (signal !== "SIGTERM") {
-			await flushRawStdout();
-		}
-		process.exit(exitCode);
+		input.pause();
+		if (signal !== "SIGTERM") await flushRawStdout();
+		exit(exitCode);
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
@@ -817,35 +835,45 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 	};
 
-	const onInputEnd = () => {
-		void shutdown();
+	const enqueueInputLine = (line: string): void => {
+		inputQueue = inputQueue.then(() => handleInputLine(line));
 	};
-	process.stdin.on("end", onInputEnd);
+
+	const onInputEnd = () => {
+		if (inputEnded) return;
+		inputEnded = true;
+		closeInputRequests(new Error("RPC connection closed"));
+		if (inputReady) void inputQueue.then(() => shutdown());
+	};
 
 	detachInput = (() => {
-		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
-			if (inputReady) {
-				void handleInputLine(line);
-				return;
-			}
+		const detachJsonl = attachJsonlLineReader(input, (line) => {
 			try {
 				if (handleExtensionResponse(JSON.parse(line), line)) return;
 			} catch {
-				// Preserve malformed input for normal parse-error handling after startup.
+				// Preserve malformed input for normal parse-error handling.
+			}
+			if (inputReady) {
+				enqueueInputLine(line);
+				return;
 			}
 			bufferedInputLines.push(line);
 		});
+		// Register after the reader so its final unterminated line is enqueued before EOF shutdown begins.
+		input.on("end", onInputEnd);
 		return () => {
 			detachJsonl();
-			process.stdin.off("end", onInputEnd);
+			input.off("end", onInputEnd);
 		};
 	})();
 
 	registerSignalHandlers();
 	await rebindSession();
+	for (const line of bufferedInputLines.splice(0)) enqueueInputLine(line);
 	inputReady = true;
-	for (const line of bufferedInputLines.splice(0)) {
-		void handleInputLine(line);
+	if (inputEnded) {
+		await inputQueue;
+		await shutdown();
 	}
 
 	// Keep process alive forever
