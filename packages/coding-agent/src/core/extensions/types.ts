@@ -302,6 +302,8 @@ export interface CompactOptions {
 	onError?: (error: Error) => void;
 }
 
+export const EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR = "Extension host requests are unavailable in this mode.";
+
 /** Options for an RPC-only extension-to-host request. */
 export interface ExtensionHostRequestOptions {
 	/** Abort waiting locally. A late host response is ignored. */

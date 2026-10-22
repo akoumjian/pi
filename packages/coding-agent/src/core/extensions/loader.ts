@@ -45,6 +45,7 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types.ts";
+import { EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR } from "./types.ts";
 
 /** Modules available to extensions via virtualModules (for compiled binaries) */
 const VIRTUAL_MODULES: Record<string, unknown> = {
@@ -189,7 +190,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	};
 
 	const runtime: ExtensionRuntime = {
-		requestHost: () => Promise.reject(new Error("Host requests are only available in RPC mode after session start.")),
+		requestHost: () => Promise.reject(new Error(EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR)),
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,

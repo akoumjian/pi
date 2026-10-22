@@ -10,6 +10,8 @@ export const RPC_HOST_DEFAULT_TIMEOUT_MS = 30_000;
 export const RPC_HOST_MAX_TIMEOUT_MS = 120_000;
 export const RPC_HOST_MAX_ERROR_BYTES = 2 * 1024;
 export const RPC_HOST_MAX_ID_BYTES = 128;
+export const RPC_HOST_MAX_JSON_DEPTH = 64;
+export const RPC_HOST_MAX_JSON_NODES = 65_536;
 
 const SERVICE_PATTERN = /^[a-z][a-z0-9._-]{0,127}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -22,23 +24,121 @@ export function isRpcHostCorrelationId(value: unknown): value is string {
 	return typeof value === "string" && Buffer.byteLength(value) <= RPC_HOST_MAX_ID_BYTES && UUID_PATTERN.test(value);
 }
 
-export function isJsonValue(value: unknown, ancestors = new Set<object>()): value is JsonValue {
-	if (value === null || typeof value === "string" || typeof value === "boolean") return true;
-	if (typeof value === "number") return Number.isFinite(value);
-	if (typeof value !== "object") return false;
-	if (ancestors.has(value)) return false;
-
-	ancestors.add(value);
+export function isJsonValue(value: unknown): value is JsonValue {
 	try {
-		if (Array.isArray(value)) {
-			return value.every((item) => isJsonValue(item, ancestors));
+		const pending: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }];
+		const seen = new Set<object>();
+		let visited = 0;
+
+		while (pending.length > 0) {
+			const current = pending.pop()!;
+			visited++;
+			if (visited > RPC_HOST_MAX_JSON_NODES) return false;
+
+			const currentValue = current.value;
+			if (currentValue === null || typeof currentValue === "string" || typeof currentValue === "boolean") {
+				continue;
+			}
+			if (typeof currentValue === "number") {
+				if (!Number.isFinite(currentValue)) return false;
+				continue;
+			}
+			if (typeof currentValue !== "object" || current.depth >= RPC_HOST_MAX_JSON_DEPTH) return false;
+			if (seen.has(currentValue)) return false;
+			seen.add(currentValue);
+
+			const keys = Reflect.ownKeys(currentValue);
+			if (Array.isArray(currentValue)) {
+				if (Object.getPrototypeOf(currentValue) !== Array.prototype) return false;
+				const lengthDescriptor = Object.getOwnPropertyDescriptor(currentValue, "length");
+				if (!lengthDescriptor || !("value" in lengthDescriptor) || typeof lengthDescriptor.value !== "number") {
+					return false;
+				}
+				const length = lengthDescriptor.value;
+				if (!Number.isSafeInteger(length) || length < 0 || length > RPC_HOST_MAX_JSON_NODES - visited) return false;
+				let indices = 0;
+				for (const key of keys) {
+					if (key === "length") continue;
+					if (typeof key !== "string" || !/^(0|[1-9]\d*)$/.test(key)) return false;
+					const index = Number(key);
+					if (!Number.isSafeInteger(index) || index < 0 || index >= length) return false;
+					const descriptor = Object.getOwnPropertyDescriptor(currentValue, key);
+					if (!descriptor?.enumerable || !("value" in descriptor)) return false;
+					pending.push({ value: descriptor.value, depth: current.depth + 1 });
+					indices++;
+				}
+				if (indices !== length) return false;
+				continue;
+			}
+
+			const prototype = Object.getPrototypeOf(currentValue);
+			if (prototype !== Object.prototype && prototype !== null) return false;
+			if (keys.length > RPC_HOST_MAX_JSON_NODES - visited) return false;
+			for (const key of keys) {
+				if (typeof key !== "string") return false;
+				const descriptor = Object.getOwnPropertyDescriptor(currentValue, key);
+				if (!descriptor?.enumerable || !("value" in descriptor)) return false;
+				pending.push({ value: descriptor.value, depth: current.depth + 1 });
+			}
 		}
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+const ABORTED_GETTER = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+
+function getAbortSignalAborted(value: AbortSignal): boolean {
+	if (!ABORTED_GETTER) throw new Error("AbortSignal is unavailable");
+	return ABORTED_GETTER.call(value) as boolean;
+}
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+	try {
+		return (
+			typeof value === "object" && value !== null && typeof getAbortSignalAborted(value as AbortSignal) === "boolean"
+		);
+	} catch {
+		return false;
+	}
+}
+
+type HostRequestOptionsValidation =
+	| { valid: true; timeout: number; signal: AbortSignal | undefined }
+	| { valid: false; invalidTimeout: boolean };
+
+function validateHostRequestOptions(value: unknown): HostRequestOptionsValidation {
+	try {
+		if (typeof value !== "object" || value === null) return { valid: false, invalidTimeout: false };
 		const prototype = Object.getPrototypeOf(value);
-		if (prototype !== Object.prototype && prototype !== null) return false;
-		if (Object.getOwnPropertySymbols(value).length > 0) return false;
-		return Object.values(value).every((item) => isJsonValue(item, ancestors));
-	} finally {
-		ancestors.delete(value);
+		if (prototype !== Object.prototype && prototype !== null) return { valid: false, invalidTimeout: false };
+		const keys = Reflect.ownKeys(value);
+		if (keys.some((key) => key !== "timeout" && key !== "signal")) {
+			return { valid: false, invalidTimeout: false };
+		}
+		const timeoutDescriptor = Object.getOwnPropertyDescriptor(value, "timeout");
+		const signalDescriptor = Object.getOwnPropertyDescriptor(value, "signal");
+		if (
+			(timeoutDescriptor && !("value" in timeoutDescriptor)) ||
+			(signalDescriptor && !("value" in signalDescriptor))
+		) {
+			return { valid: false, invalidTimeout: false };
+		}
+		const timeout = timeoutDescriptor?.value ?? RPC_HOST_DEFAULT_TIMEOUT_MS;
+		if (
+			typeof timeout !== "number" ||
+			!Number.isInteger(timeout) ||
+			timeout <= 0 ||
+			timeout > RPC_HOST_MAX_TIMEOUT_MS
+		) {
+			return { valid: false, invalidTimeout: true };
+		}
+		const signal = signalDescriptor?.value;
+		if (signal !== undefined && !isAbortSignal(signal)) return { valid: false, invalidTimeout: false };
+		return { valid: true, timeout, signal };
+	} catch {
+		return { valid: false, invalidTimeout: false };
 	}
 }
 
@@ -48,29 +148,6 @@ export function serializeRpcHostMessage(value: RpcExtensionHostRequest | RpcExte
 		throw new Error(`RPC host message exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`);
 	}
 	return line;
-}
-
-export function boundedRpcHostError(error: unknown): string {
-	let raw: string;
-	try {
-		raw = error instanceof Error ? error.message : String(error);
-	} catch {
-		raw = "Host request failed";
-	}
-	const message = raw.length > 0 ? raw : "Host request failed";
-	if (Buffer.byteLength(message) <= RPC_HOST_MAX_ERROR_BYTES) return message;
-
-	let low = 0;
-	let high = message.length;
-	while (low < high) {
-		const middle = Math.ceil((low + high) / 2);
-		if (Buffer.byteLength(message.slice(0, middle)) <= RPC_HOST_MAX_ERROR_BYTES) {
-			low = middle;
-		} else {
-			high = middle - 1;
-		}
-	}
-	return message.slice(0, low);
 }
 
 interface PendingHostRequest {
@@ -97,28 +174,27 @@ export class RpcExtensionHostTransport {
 	): Promise<TResponse> {
 		if (this.closedError) return Promise.reject(this.closedError);
 		if (!isRpcHostService(service)) {
-			return Promise.reject(new Error(`Invalid host service: ${service}`));
+			return Promise.reject(new Error("Invalid host service name"));
 		}
-		try {
-			if (!isJsonValue(payload)) {
-				return Promise.reject(new Error("Host request payload must be JSON-compatible"));
-			}
-		} catch {
+		if (!isJsonValue(payload)) {
 			return Promise.reject(new Error("Host request payload must be JSON-compatible"));
 		}
 		if (this.pending.size >= RPC_HOST_MAX_PENDING_REQUESTS) {
 			return Promise.reject(new Error(`Too many pending host requests (maximum ${RPC_HOST_MAX_PENDING_REQUESTS})`));
 		}
 
-		const timeoutMs = options.timeout ?? RPC_HOST_DEFAULT_TIMEOUT_MS;
-		if (!Number.isInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > RPC_HOST_MAX_TIMEOUT_MS) {
+		const validatedOptions = validateHostRequestOptions(options);
+		if (!validatedOptions.valid) {
 			return Promise.reject(
-				new Error(`Host request timeout must be an integer from 1 to ${RPC_HOST_MAX_TIMEOUT_MS} ms`),
+				new Error(
+					validatedOptions.invalidTimeout
+						? `Host request timeout must be an integer from 1 to ${RPC_HOST_MAX_TIMEOUT_MS} ms`
+						: "Invalid host request options",
+				),
 			);
 		}
-		if (options.signal?.aborted) {
-			return Promise.reject(new Error("Host request aborted"));
-		}
+		const { timeout: timeoutMs, signal } = validatedOptions;
+		if (signal && getAbortSignalAborted(signal)) return Promise.reject(new Error("Host request aborted"));
 
 		const id = crypto.randomUUID();
 		let line: string;
@@ -133,7 +209,13 @@ export class RpcExtensionHostTransport {
 				const pending = this.pending.get(id);
 				if (!pending) return;
 				clearTimeout(pending.timeout);
-				pending.signal?.removeEventListener("abort", pending.onAbort);
+				if (pending.signal) {
+					try {
+						EventTarget.prototype.removeEventListener.call(pending.signal, "abort", pending.onAbort);
+					} catch {
+						// The pending slot must still be released if signal cleanup fails.
+					}
+				}
 				this.pending.delete(id);
 			};
 			const rejectAndCleanup = (error: Error) => {
@@ -153,12 +235,11 @@ export class RpcExtensionHostTransport {
 				},
 				reject: rejectAndCleanup,
 				timeout,
-				signal: options.signal,
+				signal,
 				onAbort,
 			});
-			options.signal?.addEventListener("abort", onAbort, { once: true });
-
 			try {
+				if (signal) EventTarget.prototype.addEventListener.call(signal, "abort", onAbort, { once: true });
 				this.outputLine(line);
 			} catch (error) {
 				rejectAndCleanup(error instanceof Error ? error : new Error(String(error)));
@@ -167,37 +248,43 @@ export class RpcExtensionHostTransport {
 	}
 
 	handleResponse(value: unknown, lineBytes: number): boolean {
-		if (typeof value !== "object" || value === null || !("id" in value)) return false;
-		const id = value.id;
-		if (!isRpcHostCorrelationId(id)) return false;
-		const pending = this.pending.get(id);
-		if (!pending) return false;
-		if (lineBytes > RPC_HOST_MAX_LINE_BYTES) {
-			pending.reject(new Error(`RPC host response exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`));
-			return true;
-		}
-		if (!("success" in value) || typeof value.success !== "boolean") {
-			pending.reject(new Error("Malformed host response"));
-			return true;
-		}
-		if (value.success) {
-			if (!("data" in value) || !isJsonValue(value.data)) {
-				pending.reject(new Error("Malformed host response data"));
+		let pending: PendingHostRequest | undefined;
+		try {
+			if (typeof value !== "object" || value === null || !("id" in value)) return false;
+			const id = value.id;
+			if (!isRpcHostCorrelationId(id)) return false;
+			pending = this.pending.get(id);
+			if (!pending) return false;
+			if (lineBytes > RPC_HOST_MAX_LINE_BYTES) {
+				pending.reject(new Error(`RPC host response exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`));
 				return true;
 			}
-			pending.resolve(value.data);
+			if (!("success" in value) || typeof value.success !== "boolean") {
+				pending.reject(new Error("Malformed host response"));
+				return true;
+			}
+			if (value.success) {
+				if (!("data" in value) || !isJsonValue(value.data)) {
+					pending.reject(new Error("Malformed host response data"));
+					return true;
+				}
+				pending.resolve(value.data);
+				return true;
+			}
+			if (!("error" in value) || typeof value.error !== "string") {
+				pending.reject(new Error("Malformed host response error"));
+				return true;
+			}
+			if (Buffer.byteLength(value.error) > RPC_HOST_MAX_ERROR_BYTES) {
+				pending.reject(new Error("Host response error exceeds 2048 bytes"));
+				return true;
+			}
+			pending.reject(new Error(value.error));
 			return true;
+		} catch {
+			pending?.reject(new Error("Malformed host response data"));
+			return pending !== undefined;
 		}
-		if (!("error" in value) || typeof value.error !== "string") {
-			pending.reject(new Error("Malformed host response error"));
-			return true;
-		}
-		if (Buffer.byteLength(value.error) > RPC_HOST_MAX_ERROR_BYTES) {
-			pending.reject(new Error("Host response error exceeds 2048 bytes"));
-			return true;
-		}
-		pending.reject(new Error(value.error));
-		return true;
 	}
 
 	close(error = new Error("RPC host transport closed")): void {

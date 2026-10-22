@@ -3,11 +3,7 @@ import * as crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, it, vi } from "vitest";
-import {
-	RPC_HOST_MAX_ERROR_BYTES,
-	RPC_HOST_MAX_LINE_BYTES,
-	RPC_HOST_MAX_PENDING_REQUESTS,
-} from "../src/modes/rpc/extension-host-transport.ts";
+import { RPC_HOST_MAX_LINE_BYTES, RPC_HOST_MAX_PENDING_REQUESTS } from "../src/modes/rpc/extension-host-transport.ts";
 import { RpcClient } from "../src/modes/rpc/rpc-client.ts";
 import type { RpcExtensionHostResponse } from "../src/modes/rpc/rpc-types.ts";
 
@@ -15,12 +11,18 @@ interface RpcClientPrivate {
 	process: ChildProcess | null;
 	handleLine(line: string): void;
 	handleHostRequest(value: unknown, lineBytes: number): Promise<void>;
+	onStdoutEnd(childProcess: ChildProcess): void;
 }
 
-function createFakeProcess(client: RpcClient): { responses: RpcExtensionHostResponse[] } {
+function createFakeProcess(client: RpcClient): {
+	child: ChildProcess;
+	responses: RpcExtensionHostResponse[];
+} {
 	const stdin = new PassThrough();
+	const stdout = new PassThrough();
 	const child = Object.assign(new EventEmitter(), {
 		stdin,
+		stdout,
 		exitCode: null,
 		signalCode: null,
 		kill: vi.fn(() => true),
@@ -38,11 +40,26 @@ function createFakeProcess(client: RpcClient): { responses: RpcExtensionHostResp
 			responses.push(JSON.parse(line) as RpcExtensionHostResponse);
 		}
 	});
-	return { responses };
+	return { child, responses };
 }
 
 function hostRequest(id: string, service: string, payload: unknown): string {
 	return JSON.stringify({ type: "extension_host_request", id, service, payload });
+}
+
+function nestedArray(depth: number): unknown {
+	let value: unknown = null;
+	for (let index = 0; index < depth; index++) value = [value];
+	return value;
+}
+
+function errorOf(response: RpcExtensionHostResponse): string {
+	if (response.success) throw new Error("Expected an error response");
+	return response.error;
+}
+
+function flushAsyncHandler(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
 }
 
 describe("RpcClient extension host requests", () => {
@@ -75,12 +92,24 @@ describe("RpcClient extension host requests", () => {
 		]);
 	});
 
-	it("returns bounded failures for unknown services, malformed requests, handler errors, and oversized results", async () => {
+	it("uses fixed bounded failures without exposing handler or provider text", async () => {
+		const secret = "secret-provider-body-with-token";
 		const client = new RpcClient({
 			hostRequestHandlers: {
 				failure: () => {
-					throw new Error("x".repeat(RPC_HOST_MAX_ERROR_BYTES * 2));
+					throw new Error(secret);
 				},
+				invalid: () =>
+					({
+						response: new Proxy(
+							{},
+							{
+								ownKeys: () => {
+									throw new Error(secret);
+								},
+							},
+						),
+					}) as never,
 				oversized: () => "x".repeat(RPC_HOST_MAX_LINE_BYTES),
 			},
 		});
@@ -92,18 +121,87 @@ describe("RpcClient extension host requests", () => {
 			100,
 		);
 		privateClient.handleLine(hostRequest(crypto.randomUUID(), "failure", null));
+		privateClient.handleLine(hostRequest(crypto.randomUUID(), "invalid", null));
 		privateClient.handleLine(hostRequest(crypto.randomUUID(), "oversized", null));
 
-		await vi.waitFor(() => expect(responses).toHaveLength(4));
-		expect(responses.every((response) => !response.success)).toBe(true);
-		const errors = responses.map((response) => (response.success ? "" : response.error));
-		expect(errors[0]).toContain("No host handler registered");
-		expect(errors[1]).toBe("Malformed extension host request");
-		expect(Buffer.byteLength(errors[2])).toBe(RPC_HOST_MAX_ERROR_BYTES);
-		expect(errors[3]).toContain("response exceeds");
+		await vi.waitFor(() => expect(responses).toHaveLength(5));
+		expect(responses.map(errorOf)).toEqual([
+			"Host service unavailable",
+			"Malformed extension host request",
+			"Host handler failed",
+			"Invalid host handler response",
+			"Host handler response exceeds maximum size",
+		]);
+		expect(JSON.stringify(responses)).not.toContain(secret);
 	});
 
-	it("ignores duplicate ids and enforces the active request bound", async () => {
+	it("rejects deeply nested malformed requests without terminating later dispatch", async () => {
+		const handler = vi.fn(() => ({ ok: true }));
+		const client = new RpcClient({ hostRequestHandlers: { work: handler } });
+		const { responses } = createFakeProcess(client);
+		const privateClient = client as unknown as RpcClientPrivate;
+		const deepId = crypto.randomUUID();
+		const deepLine = `{"type":"extension_host_request","id":"${deepId}","service":"work","payload":${"[".repeat(3000)}null${"]".repeat(3000)}}`;
+
+		expect(() => privateClient.handleLine(deepLine)).not.toThrow();
+		privateClient.handleLine(hostRequest(crypto.randomUUID(), "work", null));
+
+		await vi.waitFor(() => expect(responses).toHaveLength(2));
+		expect(errorOf(responses[0])).toBe("Malformed extension host request");
+		expect(responses[1]).toMatchObject({ success: true, data: { ok: true } });
+		expect(handler).toHaveBeenCalledOnce();
+	});
+
+	it("rejects a deeply nested matched handler result without disturbing other requests", async () => {
+		const client = new RpcClient({
+			hostRequestHandlers: {
+				deep: () => nestedArray(3000) as never,
+				valid: () => ({ ok: true }),
+			},
+		});
+		const { responses } = createFakeProcess(client);
+		const privateClient = client as unknown as RpcClientPrivate;
+		privateClient.handleLine(hostRequest(crypto.randomUUID(), "deep", null));
+		privateClient.handleLine(hostRequest(crypto.randomUUID(), "valid", null));
+
+		await vi.waitFor(() => expect(responses).toHaveLength(2));
+		expect(responses.map((response) => (response.success ? "ok" : response.error))).toEqual([
+			"Invalid host handler response",
+			"ok",
+		]);
+	});
+
+	it("retires and aborts the original request on a duplicate active id, with exactly one failure", async () => {
+		let observedSignal: AbortSignal | undefined;
+		const handler = vi.fn(
+			(_payload: unknown, { signal }: { signal: AbortSignal }) =>
+				new Promise<null>((_resolve, reject) => {
+					observedSignal = signal;
+					signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+				}),
+		);
+		const client = new RpcClient({ hostRequestHandlers: { hold: handler } });
+		const { responses } = createFakeProcess(client);
+		const privateClient = client as unknown as RpcClientPrivate;
+		const id = crypto.randomUUID();
+		privateClient.handleLine(hostRequest(id, "hold", null));
+		await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+		privateClient.handleLine(hostRequest(id, "hold", null));
+
+		await vi.waitFor(() => expect(responses).toHaveLength(1));
+		expect(observedSignal?.aborted).toBe(true);
+		expect(responses[0]).toEqual({
+			type: "extension_host_response",
+			id,
+			success: false,
+			error: "Duplicate extension host request id",
+		});
+		await flushAsyncHandler();
+		expect(responses).toHaveLength(1);
+		expect(handler).toHaveBeenCalledOnce();
+	});
+
+	it("enforces the active request bound with a stable failure", async () => {
 		const resolvers: Array<(value: null) => void> = [];
 		const handler = vi.fn(
 			() =>
@@ -114,17 +212,13 @@ describe("RpcClient extension host requests", () => {
 		const client = new RpcClient({ hostRequestHandlers: { hold: handler } });
 		const { responses } = createFakeProcess(client);
 		const privateClient = client as unknown as RpcClientPrivate;
-		const firstId = crypto.randomUUID();
-		privateClient.handleLine(hostRequest(firstId, "hold", null));
-		privateClient.handleLine(hostRequest(firstId, "hold", null));
-
-		for (let index = 1; index < RPC_HOST_MAX_PENDING_REQUESTS; index++) {
+		for (let index = 0; index < RPC_HOST_MAX_PENDING_REQUESTS; index++) {
 			privateClient.handleLine(hostRequest(crypto.randomUUID(), "hold", null));
 		}
 		await vi.waitFor(() => expect(handler).toHaveBeenCalledTimes(RPC_HOST_MAX_PENDING_REQUESTS));
 		privateClient.handleLine(hostRequest(crypto.randomUUID(), "hold", null));
 		await vi.waitFor(() => expect(responses).toHaveLength(1));
-		expect(responses[0]).toMatchObject({ success: false, error: expect.stringContaining("Too many active") });
+		expect(errorOf(responses[0])).toBe("Host request limit exceeded");
 
 		for (const resolve of resolvers) resolve(null);
 		await vi.waitFor(() => expect(responses).toHaveLength(RPC_HOST_MAX_PENDING_REQUESTS + 1));
@@ -142,8 +236,49 @@ describe("RpcClient extension host requests", () => {
 
 		expect(handler).not.toHaveBeenCalled();
 		expect(responses).toHaveLength(1);
-		expect(responses[0]).toMatchObject({ success: false, error: expect.stringContaining("request exceeds") });
+		expect(errorOf(responses[0])).toBe("Malformed extension host request");
 	});
+
+	it("treats stdout EOF as terminal and aborts active handlers", async () => {
+		let signal: AbortSignal | undefined;
+		const handler = vi.fn(
+			(_payload: unknown, context: { signal: AbortSignal }) =>
+				new Promise<null>(() => {
+					signal = context.signal;
+				}),
+		);
+		const client = new RpcClient({ hostRequestHandlers: { hold: handler } });
+		const { child } = createFakeProcess(client);
+		const privateClient = client as unknown as RpcClientPrivate;
+		privateClient.handleLine(hostRequest(crypto.randomUUID(), "hold", null));
+		await vi.waitFor(() => expect(handler).toHaveBeenCalledOnce());
+
+		privateClient.onStdoutEnd(child);
+
+		expect(signal?.aborted).toBe(true);
+		privateClient.handleLine(hostRequest(crypto.randomUUID(), "hold", null));
+		await flushAsyncHandler();
+		expect(handler).toHaveBeenCalledOnce();
+	});
+
+	it("never rejects host-request dispatch when response output fails", async () => {
+		const client = new RpcClient({ hostRequestHandlers: { work: () => null } });
+		const { child } = createFakeProcess(client);
+		const stdin = child.stdin;
+		if (!stdin) throw new Error("Fake process stdin is missing");
+		stdin.write = (() => {
+			throw new Error("synthetic output failure");
+		}) as typeof stdin.write;
+		const id = crypto.randomUUID();
+
+		await expect(
+			(client as unknown as RpcClientPrivate).handleHostRequest(
+				{ type: "extension_host_request", id, service: "work", payload: null },
+				100,
+			),
+		).resolves.toBeUndefined();
+	});
+
 	it("does not start new handlers after shutdown begins", async () => {
 		const handler = vi.fn(() => null);
 		const client = new RpcClient({ hostRequestHandlers: { work: handler } });

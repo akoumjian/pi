@@ -45,7 +45,7 @@ process.stdin.resume();
 		expect(readFileSync(marker, "utf8")).toBe("eof");
 	});
 
-	it("escalates to SIGTERM after five seconds and SIGKILL one second later", async () => {
+	it("escalates on schedule but remains pending after SIGKILL until actual exit", async () => {
 		vi.useFakeTimers();
 		const client = new RpcClient();
 		const stdin = new PassThrough();
@@ -53,15 +53,16 @@ process.stdin.resume();
 			stdin,
 			exitCode: null,
 			signalCode: null,
-			kill: vi.fn((signal?: NodeJS.Signals | number) => {
-				if (signal === "SIGKILL") queueMicrotask(() => child.emit("exit", null, "SIGKILL"));
-				return true;
-			}),
+			kill: vi.fn(() => true),
 		}) as unknown as ChildProcess;
+		child.on("error", () => {});
 		(client as unknown as { process: ChildProcess | null }).process = child;
 		const end = vi.spyOn(stdin, "end");
+		let settled = false;
 
-		const stopping = client.stop();
+		const stopping = client.stop().then(() => {
+			settled = true;
+		});
 		expect(end).toHaveBeenCalledOnce();
 		await vi.advanceTimersByTimeAsync(4999);
 		expect(child.kill).not.toHaveBeenCalled();
@@ -69,6 +70,55 @@ process.stdin.resume();
 		expect(child.kill).toHaveBeenNthCalledWith(1, "SIGTERM");
 		await vi.advanceTimersByTimeAsync(1000);
 		expect(child.kill).toHaveBeenNthCalledWith(2, "SIGKILL");
+		expect(settled).toBe(false);
+
+		child.emit("error", new Error("synthetic child error"));
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		child.emit("exit", null, "SIGKILL");
+		await stopping;
+		expect(settled).toBe(true);
+	});
+
+	it("writes bounded cancellation failures before closing stdin on explicit stop", async () => {
+		let signal: AbortSignal | undefined;
+		const client = new RpcClient({
+			hostRequestHandlers: {
+				hold: (_payload, context) =>
+					new Promise<null>(() => {
+						signal = context.signal;
+					}),
+			},
+		});
+		const stdin = new PassThrough();
+		const child = Object.assign(new EventEmitter(), {
+			stdin,
+			exitCode: null,
+			signalCode: null,
+			kill: vi.fn(() => true),
+		}) as unknown as ChildProcess;
+		(client as unknown as { process: ChildProcess | null }).process = child;
+		const response = new Promise<Record<string, unknown>>((resolve) => {
+			stdin.once("data", (chunk) => resolve(JSON.parse(chunk.toString()) as Record<string, unknown>));
+		});
+		const id = "123e4567-e89b-42d3-a456-426614174000";
+		(client as unknown as { handleLine(line: string): void }).handleLine(
+			JSON.stringify({ type: "extension_host_request", id, service: "hold", payload: null }),
+		);
+		await vi.waitFor(() => expect(signal).toBeDefined());
+
+		const stopping = client.stop();
+		await expect(response).resolves.toEqual({
+			type: "extension_host_response",
+			id,
+			success: false,
+			error: "Host request cancelled: RPC client stopping",
+		});
+		expect(signal?.aborted).toBe(true);
+		expect(stdin.writableEnded).toBe(true);
+
+		child.emit("exit", 0, null);
 		await stopping;
 	});
 });

@@ -12,6 +12,12 @@ function requestFrom(line: string): RpcExtensionHostRequest {
 	return JSON.parse(line) as RpcExtensionHostRequest;
 }
 
+function nestedArray(depth: number): unknown {
+	let value: unknown = null;
+	for (let index = 0; index < depth; index++) value = [value];
+	return value;
+}
+
 describe("RPC extension host transport", () => {
 	it("correlates concurrent responses received out of order", async () => {
 		const lines: string[] = [];
@@ -44,7 +50,50 @@ describe("RPC extension host transport", () => {
 
 		await expect(transport.request("Invalid", null)).rejects.toThrow("Invalid host service");
 		await expect(transport.request("valid", { bad: undefined } as never)).rejects.toThrow("JSON-compatible");
+		await expect(transport.request("valid", nestedArray(3000) as never)).rejects.toThrow("JSON-compatible");
+		const cyclic: Record<string, unknown> = {};
+		cyclic.self = cyclic;
+		await expect(transport.request("valid", cyclic as never)).rejects.toThrow("JSON-compatible");
+		const repeated = {};
+		await expect(transport.request("valid", [repeated, repeated] as never)).rejects.toThrow("JSON-compatible");
+		await expect(transport.request("valid", Number.NaN as never)).rejects.toThrow("JSON-compatible");
+		await expect(transport.request("valid", new Date() as never)).rejects.toThrow("JSON-compatible");
+		await expect(transport.request("valid", { [Symbol("hidden")]: true } as never)).rejects.toThrow(
+			"JSON-compatible",
+		);
+		const revoked = Proxy.revocable({}, {});
+		revoked.revoke();
+		await expect(transport.request("valid", revoked.proxy as never)).rejects.toThrow("JSON-compatible");
+		const sparse: unknown[] = [];
+		sparse.length = 1;
+		await expect(transport.request("valid", sparse as never)).rejects.toThrow("JSON-compatible");
+		const getter = vi.fn(() => "secret");
+		const accessor = {};
+		Object.defineProperty(accessor, "value", { enumerable: true, get: getter });
+		await expect(transport.request("valid", accessor as never)).rejects.toThrow("JSON-compatible");
+		expect(getter).not.toHaveBeenCalled();
+		await expect(transport.request("valid", null, { signal: {} as AbortSignal })).rejects.toThrow(
+			"Invalid host request options",
+		);
+		const fakeSignal = {
+			aborted: false,
+			addEventListener: () => {},
+			removeEventListener: () => {},
+		} as unknown as AbortSignal;
+		await expect(transport.request("valid", null, { signal: fakeSignal })).rejects.toThrow(
+			"Invalid host request options",
+		);
 		await expect(transport.request("valid", null, { timeout: 0 })).rejects.toThrow("integer from 1");
+		const timeoutGetter = vi.fn(() => 1000);
+		const accessorOptions = {};
+		Object.defineProperty(accessorOptions, "timeout", { enumerable: true, get: timeoutGetter });
+		await expect(transport.request("valid", null, accessorOptions as never)).rejects.toThrow(
+			"Invalid host request options",
+		);
+		expect(timeoutGetter).not.toHaveBeenCalled();
+		await expect(transport.request("valid", Array.from({ length: 65_536 }, () => null) as never)).rejects.toThrow(
+			"JSON-compatible",
+		);
 		await expect(transport.request("valid", "x".repeat(RPC_HOST_MAX_LINE_BYTES))).rejects.toThrow("exceeds");
 
 		const pending = Array.from({ length: RPC_HOST_MAX_PENDING_REQUESTS }, (_, index) =>
@@ -98,13 +147,23 @@ describe("RPC extension host transport", () => {
 		expect(transport.handleResponse({ id: malformedId, success: true }, 100)).toBe(true);
 		await expect(malformed).rejects.toThrow("Malformed host response data");
 
+		const deeplyNested = transport.request("deep", null);
+		const deeplyNestedId = requestFrom(lines[1]).id;
+		expect(() =>
+			transport.handleResponse(
+				{ type: "extension_host_response", id: deeplyNestedId, success: true, data: nestedArray(3000) },
+				4096,
+			),
+		).not.toThrow();
+		await expect(deeplyNested).rejects.toThrow("Malformed host response data");
+
 		const unknownId = crypto.randomUUID();
 		expect(
 			transport.handleResponse({ type: "extension_host_response", id: unknownId, success: true, data: null }, 100),
 		).toBe(false);
 
 		const successful = transport.request("success", null);
-		const successfulId = requestFrom(lines[1]).id;
+		const successfulId = requestFrom(lines[2]).id;
 		expect(
 			transport.handleResponse(
 				{ type: "extension_host_response", id: successfulId, success: true, data: "ok" },
@@ -120,7 +179,7 @@ describe("RPC extension host transport", () => {
 		).toBe(false);
 
 		const oversized = transport.request("oversized", null);
-		const oversizedId = requestFrom(lines[2]).id;
+		const oversizedId = requestFrom(lines[3]).id;
 		expect(
 			transport.handleResponse(
 				{ type: "extension_host_response", id: oversizedId, success: true, data: null },
@@ -130,7 +189,7 @@ describe("RPC extension host transport", () => {
 		await expect(oversized).rejects.toThrow("response exceeds");
 
 		const error = transport.request("error", null);
-		const errorId = requestFrom(lines[3]).id;
+		const errorId = requestFrom(lines[4]).id;
 		expect(
 			transport.handleResponse(
 				{

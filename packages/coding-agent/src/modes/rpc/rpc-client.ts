@@ -13,7 +13,6 @@ import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
 import {
-	boundedRpcHostError,
 	isJsonValue,
 	isRpcHostCorrelationId,
 	isRpcHostService,
@@ -40,6 +39,19 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 
 /** RpcCommand without the id field (for internal send) */
 type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
+
+interface ActiveHostRequest {
+	controller: AbortController;
+}
+
+const HOST_FAILURE_DUPLICATE_ID = "Duplicate extension host request id";
+const HOST_FAILURE_HANDLER = "Host handler failed";
+const HOST_FAILURE_INVALID_RESPONSE = "Invalid host handler response";
+const HOST_FAILURE_MALFORMED_REQUEST = "Malformed extension host request";
+const HOST_FAILURE_REQUEST_LIMIT = "Host request limit exceeded";
+const HOST_FAILURE_RESPONSE_TOO_LARGE = "Host handler response exceeds maximum size";
+const HOST_FAILURE_SERVICE_UNAVAILABLE = "Host service unavailable";
+const HOST_FAILURE_STOPPING = "Host request cancelled: RPC client stopping";
 
 export interface RpcHostRequestContext {
 	id: string;
@@ -93,14 +105,14 @@ export class RpcClient {
 	private exitError: Error | null = null;
 	private options: RpcClientOptions;
 	private hostRequestHandlers = new Map<string, RpcHostRequestHandler>();
-	private activeHostRequests = new Map<string, AbortController>();
+	private activeHostRequests = new Map<string, ActiveHostRequest>();
 	private stopping = false;
 	private stopPromise: Promise<void> | null = null;
 
 	constructor(options: RpcClientOptions = {}) {
 		this.options = options;
 		for (const [service, handler] of Object.entries(options.hostRequestHandlers ?? {})) {
-			if (!isRpcHostService(service)) throw new Error(`Invalid host service: ${service}`);
+			if (!isRpcHostService(service)) throw new Error("Invalid host service name");
 			this.hostRequestHandlers.set(service, handler);
 		}
 	}
@@ -145,26 +157,19 @@ export class RpcClient {
 
 		childProcess.once("exit", (code, signal) => {
 			if (this.process !== childProcess) return;
-			const error = this.stopping ? new Error("RPC client stopped") : this.createProcessExitError(code, signal);
-			this.exitError = error;
-			this.abortHostRequests();
-			this.rejectPendingRequests(error);
+			this.closeTransport(
+				this.stopping ? new Error("RPC client stopped") : this.createProcessExitError(code, signal),
+			);
 		});
 		childProcess.once("error", (error) => {
 			if (this.process !== childProcess) return;
-			const processError = new Error(`Agent process error: ${error.message}. Stderr: ${this.stderr}`);
-			this.exitError = processError;
-			this.abortHostRequests();
-			this.rejectPendingRequests(processError);
+			this.closeTransport(new Error(`Agent process error: ${error.message}. Stderr: ${this.stderr}`));
 		});
 		childProcess.stdin?.on("error", (error) => {
 			if (this.process !== childProcess) return;
-			const stdinError =
-				this.exitError ?? new Error(`Agent process stdin error: ${error.message}. Stderr: ${this.stderr}`);
-			this.exitError = stdinError;
-			this.abortHostRequests();
-			this.rejectPendingRequests(stdinError);
+			this.closeTransport(new Error(`Agent process stdin error: ${error.message}. Stderr: ${this.stderr}`));
 		});
+		childProcess.stdout?.once("end", () => this.onStdoutEnd(childProcess));
 
 		// Set up strict JSONL reader for stdout.
 		this.stopReadingStdout = attachJsonlLineReader(childProcess.stdout!, (line) => {
@@ -200,7 +205,7 @@ export class RpcClient {
 
 	private async stopProcess(childProcess: ChildProcess): Promise<void> {
 		this.stopping = true;
-		this.abortHostRequests();
+		this.cancelActiveHostRequests(HOST_FAILURE_STOPPING);
 
 		try {
 			if (childProcess.stdin && !childProcess.stdin.destroyed && !childProcess.stdin.writableEnded) {
@@ -211,10 +216,10 @@ export class RpcClient {
 		}
 
 		if (!(await this.waitForProcessExit(childProcess, 5000))) {
-			childProcess.kill("SIGTERM");
+			this.signalProcess(childProcess, "SIGTERM");
 			if (!(await this.waitForProcessExit(childProcess, 1000))) {
-				childProcess.kill("SIGKILL");
-				await this.waitForProcessExit(childProcess, 1000);
+				this.signalProcess(childProcess, "SIGKILL");
+				await this.waitForProcessExit(childProcess);
 			}
 		}
 
@@ -227,19 +232,34 @@ export class RpcClient {
 		this.stopping = false;
 	}
 
-	private waitForProcessExit(childProcess: ChildProcess, timeoutMs: number): Promise<boolean> {
+	private signalProcess(childProcess: ChildProcess, signal: NodeJS.Signals): void {
+		try {
+			childProcess.kill(signal);
+		} catch {
+			// The exit event remains authoritative even if signaling reports an error.
+		}
+	}
+
+	private onStdoutEnd(childProcess: ChildProcess): void {
+		if (this.process !== childProcess) return;
+		this.closeTransport(
+			this.stopping
+				? new Error("RPC client stopped")
+				: new Error(`Agent process stdout ended. Stderr: ${this.stderr}`),
+		);
+	}
+
+	private waitForProcessExit(childProcess: ChildProcess, timeoutMs?: number): Promise<boolean> {
 		if (childProcess.exitCode !== null || childProcess.signalCode !== null) return Promise.resolve(true);
 		return new Promise((resolve) => {
 			const finish = (exited: boolean) => {
-				clearTimeout(timeout);
+				if (timeout !== undefined) clearTimeout(timeout);
 				childProcess.off("exit", onExit);
-				childProcess.off("error", onExit);
 				resolve(exited);
 			};
 			const onExit = () => finish(true);
-			const timeout = setTimeout(() => finish(false), timeoutMs);
+			const timeout = timeoutMs === undefined ? undefined : setTimeout(() => finish(false), timeoutMs);
 			childProcess.once("exit", onExit);
-			childProcess.once("error", onExit);
 		});
 	}
 
@@ -595,7 +615,9 @@ export class RpcClient {
 			const data: unknown = JSON.parse(line);
 
 			if (typeof data === "object" && data !== null && "type" in data && data.type === "extension_host_request") {
-				void this.handleHostRequest(data, Buffer.byteLength(line) + 1);
+				void this.handleHostRequest(data, Buffer.byteLength(line) + 1).catch(() => {
+					this.writeMalformedRequestFailure(data);
+				});
 				return;
 			}
 
@@ -625,64 +647,94 @@ export class RpcClient {
 	}
 
 	private async handleHostRequest(value: unknown, lineBytes: number): Promise<void> {
-		if (this.stopping || this.exitError) return;
-		if (typeof value !== "object" || value === null || !("id" in value)) return;
-		const id = value.id;
-		if (!isRpcHostCorrelationId(id) || this.activeHostRequests.has(id)) return;
+		let id: string | undefined;
+		let active: ActiveHostRequest | undefined;
+		try {
+			if (this.stopping || this.exitError) return;
+			if (typeof value !== "object" || value === null || !("id" in value)) return;
+			if (!isRpcHostCorrelationId(value.id)) return;
+			id = value.id;
 
-		const fail = (error: unknown) => {
+			const duplicate = this.activeHostRequests.get(id);
+			if (duplicate) {
+				this.retireHostRequest(id, duplicate);
+				this.writeHostFailure(id, HOST_FAILURE_DUPLICATE_ID);
+				return;
+			}
+			if (lineBytes > RPC_HOST_MAX_LINE_BYTES) {
+				this.writeHostFailure(id, HOST_FAILURE_MALFORMED_REQUEST);
+				return;
+			}
+			if (
+				!("service" in value) ||
+				!isRpcHostService(value.service) ||
+				!("payload" in value) ||
+				!isJsonValue(value.payload)
+			) {
+				this.writeHostFailure(id, HOST_FAILURE_MALFORMED_REQUEST);
+				return;
+			}
+			if (this.activeHostRequests.size >= RPC_HOST_MAX_PENDING_REQUESTS) {
+				this.writeHostFailure(id, HOST_FAILURE_REQUEST_LIMIT);
+				return;
+			}
+
+			const request = value as RpcExtensionHostRequest;
+			const handler = this.hostRequestHandlers.get(request.service);
+			if (!handler) {
+				this.writeHostFailure(id, HOST_FAILURE_SERVICE_UNAVAILABLE);
+				return;
+			}
+
+			active = { controller: new AbortController() };
+			this.activeHostRequests.set(id, active);
+			let data: JsonValue;
 			try {
-				this.writeHostResponse({
-					type: "extension_host_response",
+				data = await handler(request.payload, {
 					id,
-					success: false,
-					error: boundedRpcHostError(error),
+					service: request.service,
+					signal: active.controller.signal,
 				});
 			} catch {
-				// The stdin/process error path owns cleanup when a failure response cannot be written.
+				if (!active.controller.signal.aborted) this.writeHostFailure(id, HOST_FAILURE_HANDLER);
+				return;
 			}
-		};
-		if (lineBytes > RPC_HOST_MAX_LINE_BYTES) {
-			fail(`RPC host request exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`);
-			return;
-		}
-		if (
-			!("service" in value) ||
-			!isRpcHostService(value.service) ||
-			!("payload" in value) ||
-			!isJsonValue(value.payload)
-		) {
-			fail("Malformed extension host request");
-			return;
-		}
-		if (this.activeHostRequests.size >= RPC_HOST_MAX_PENDING_REQUESTS) {
-			fail(`Too many active host requests (maximum ${RPC_HOST_MAX_PENDING_REQUESTS})`);
-			return;
-		}
-
-		const request = value as RpcExtensionHostRequest;
-		const handler = this.hostRequestHandlers.get(request.service);
-		if (!handler) {
-			fail(`No host handler registered for service: ${request.service}`);
-			return;
-		}
-
-		const controller = new AbortController();
-		this.activeHostRequests.set(id, controller);
-		try {
-			const data = await handler(request.payload, { id, service: request.service, signal: controller.signal });
-			if (controller.signal.aborted) return;
-			if (!isJsonValue(data)) throw new Error("Host handler result must be JSON-compatible");
-			const response: RpcExtensionHostResponse = { type: "extension_host_response", id, success: true, data };
+			if (active.controller.signal.aborted) return;
+			if (!isJsonValue(data)) {
+				this.writeHostFailure(id, HOST_FAILURE_INVALID_RESPONSE);
+				return;
+			}
 			try {
-				this.writeHostResponse(response);
+				this.writeHostResponse({ type: "extension_host_response", id, success: true, data });
 			} catch {
-				fail(`RPC host response exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`);
+				this.writeHostFailure(id, HOST_FAILURE_RESPONSE_TOO_LARGE);
 			}
-		} catch (error) {
-			if (!controller.signal.aborted) fail(error);
+		} catch {
+			if (id !== undefined && !this.stopping && !this.exitError) {
+				if (active) this.retireHostRequest(id, active);
+				this.writeHostFailure(id, HOST_FAILURE_MALFORMED_REQUEST);
+			}
 		} finally {
-			if (this.activeHostRequests.get(id) === controller) this.activeHostRequests.delete(id);
+			if (id !== undefined && active && this.activeHostRequests.get(id) === active) {
+				this.activeHostRequests.delete(id);
+			}
+		}
+	}
+
+	private writeMalformedRequestFailure(value: unknown): void {
+		try {
+			if (this.stopping || this.exitError || typeof value !== "object" || value === null || !("id" in value)) return;
+			if (isRpcHostCorrelationId(value.id)) this.writeHostFailure(value.id, HOST_FAILURE_MALFORMED_REQUEST);
+		} catch {
+			// A malformed value without a safely readable id cannot be correlated.
+		}
+	}
+
+	private writeHostFailure(id: string, error: string): void {
+		try {
+			this.writeHostResponse({ type: "extension_host_response", id, success: false, error });
+		} catch {
+			// The transport boundary owns cleanup when a bounded failure cannot be written.
 		}
 	}
 
@@ -703,9 +755,23 @@ export class RpcClient {
 		stdin.write(serializeRpcHostMessage(response));
 	}
 
-	private abortHostRequests(): void {
-		for (const controller of this.activeHostRequests.values()) controller.abort();
-		this.activeHostRequests.clear();
+	private retireHostRequest(id: string, active: ActiveHostRequest): void {
+		if (this.activeHostRequests.get(id) === active) this.activeHostRequests.delete(id);
+		active.controller.abort();
+	}
+
+	private cancelActiveHostRequests(error?: string): void {
+		for (const [id, active] of [...this.activeHostRequests]) {
+			this.retireHostRequest(id, active);
+			if (error !== undefined) this.writeHostFailure(id, error);
+		}
+	}
+
+	private closeTransport(error: Error): void {
+		const terminalError = this.exitError ?? error;
+		this.exitError = terminalError;
+		this.cancelActiveHostRequests();
+		this.rejectPendingRequests(terminalError);
 	}
 
 	private createProcessExitError(code: number | null, signal: NodeJS.Signals | null): Error {

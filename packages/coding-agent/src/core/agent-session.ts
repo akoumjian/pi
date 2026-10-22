@@ -70,6 +70,7 @@ import { exportSessionToHtml, type ToolHtmlRenderer } from "./export-html/index.
 import { createToolHtmlRenderer } from "./export-html/tool-renderer.ts";
 import {
 	type ContextUsage,
+	EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
 	type ExtensionHostRequestHandler,
@@ -2737,7 +2738,7 @@ export class AgentSession {
 				requestHost: (service, payload, options) => {
 					const handler = this._extensionHostRequestHandler;
 					if (!handler) {
-						return Promise.reject(new Error("Host requests are only available in RPC mode."));
+						return Promise.reject(new Error(EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR));
 					}
 					return handler(service, payload, options);
 				},

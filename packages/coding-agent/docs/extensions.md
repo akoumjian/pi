@@ -1370,7 +1370,9 @@ const result = await pi.requestHost<{ accepted: boolean }>(
 );
 ```
 
-`service` must match `^[a-z][a-z0-9._-]{0,127}$`. The payload and response must be JSON-compatible. Requests default to a 30-second timeout; `timeout` is in milliseconds and can be at most 120 seconds. At most 16 requests may be pending, and each serialized protocol line is limited to 256 KiB. Aborting or timing out rejects locally; any later response is ignored.
+`service` must match `^[a-z][a-z0-9._-]{0,127}$`. The payload and response must be bounded JSON-compatible values (at most 64 levels and 65,536 visited values); cyclic/repeated references, sparse arrays, accessors, symbol keys, exotic prototypes, failing proxies, non-finite numbers, and unsupported values are rejected. Requests default to a 30-second timeout; `timeout` is in milliseconds and can be at most 120 seconds. At most 16 requests may be pending, and each serialized protocol line is limited to 256 KiB. Aborting or timing out rejects locally; any later response is ignored.
+
+Outside an active RPC transport the promise rejects with `Extension host requests are unavailable in this mode.` A malformed response for a matched request rejects only that request. During explicit RPC client shutdown, active requests receive a bounded cancellation failure before stdin closes; child stdout EOF also closes the transport and rejects pending requests.
 
 The RPC host registers handlers through `RpcClient.hostRequestHandlers`. Pi does not assign meaning to service names or payloads. See [RPC Mode](rpc.md#extension-host-request-protocol) for the wire format and complete limits.
 

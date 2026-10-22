@@ -182,6 +182,7 @@ export type {
 // Type guards
 export {
 	defineTool,
+	EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR,
 	isBashToolResult,
 	isEditToolResult,
 	isFindToolResult,

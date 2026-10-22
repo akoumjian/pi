@@ -16,7 +16,9 @@ describe("extension host request API", () => {
 			runtime,
 		);
 
-		await expect(api!.requestHost("example", null)).rejects.toThrow("only available in RPC mode");
+		await expect(api!.requestHost("example", null)).rejects.toThrow(
+			"Extension host requests are unavailable in this mode.",
+		);
 
 		const requestHost = vi.fn(async () => ({ accepted: true }));
 		runtime.requestHost = requestHost;

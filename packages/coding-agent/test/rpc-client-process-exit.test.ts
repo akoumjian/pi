@@ -33,37 +33,56 @@ process.stdin.resume();
 
 		await client.start();
 
-		await expect(client.getCommands()).rejects.toThrow(/Agent process exited \(code=43 signal=null\)/);
+		await expect(client.getCommands()).rejects.toThrow(/Agent process (?:stdout ended|exited)/);
 	});
 
-	test("aborts an active host handler when the child process exits", async () => {
-		let observeAbort: (() => void) | undefined;
-		const aborted = new Promise<void>((resolve) => {
-			observeAbort = resolve;
-		});
-		const client = new RpcClient({
-			cliPath: writeChildScript(`
+	test("deterministically aborts active host handlers when the child exits", async () => {
+		for (let iteration = 0; iteration < 10; iteration++) {
+			let observeAbort: (() => void) | undefined;
+			const aborted = new Promise<void>((resolve) => {
+				observeAbort = resolve;
+			});
+			let observeHandlerStart: (() => void) | undefined;
+			const handlerStarted = new Promise<void>((resolve) => {
+				observeHandlerStart = resolve;
+			});
+			const client = new RpcClient({
+				cliPath: writeChildScript(`
+process.on("SIGTERM", () => process.exit(44));
 process.stdout.write(JSON.stringify({
   type: "extension_host_request",
   id: "123e4567-e89b-42d3-a456-426614174000",
   service: "wait",
   payload: null
 }) + "\\n");
-setTimeout(() => process.exit(44), 25);
+process.stdin.resume();
 `),
-			hostRequestHandlers: {
-				wait: (_payload, { signal }) =>
-					new Promise((resolve) => {
-						signal.addEventListener("abort", () => {
-							observeAbort?.();
-							resolve(null);
-						});
-					}),
-			},
-		});
+				hostRequestHandlers: {
+					wait: (_payload, { signal }) =>
+						new Promise((resolve) => {
+							observeHandlerStart?.();
+							signal.addEventListener("abort", () => {
+								observeAbort?.();
+								resolve(null);
+							});
+						}),
+				},
+			});
 
-		await expect(client.start()).rejects.toThrow(/Agent process exited \(code=44 signal=null\)/);
-		await expect(aborted).resolves.toBeUndefined();
+			await client.start();
+			await handlerStarted;
+			const child = (
+				client as unknown as {
+					process: import("node:child_process").ChildProcess;
+				}
+			).process;
+			const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+			const pending = client.getCommands();
+			child.kill("SIGTERM");
+			await expect(aborted).resolves.toBeUndefined();
+			await expect(pending).rejects.toThrow(/Agent process (?:stdout ended|exited)/);
+			await exited;
+		}
 	});
 	test("rejects pending work on an RPC stdin error", async () => {
 		const client = new RpcClient({
