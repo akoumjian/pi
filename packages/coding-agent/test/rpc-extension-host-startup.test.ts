@@ -8,16 +8,35 @@ import type { RpcExtensionHostRequest, RpcExtensionUIRequest } from "../src/mode
 
 const rpcIo = vi.hoisted(() => ({
 	outputLines: [] as string[],
+	flushRawStdout: vi.fn(async () => {}),
+	rawStdoutFailureHandler: undefined as ((error: Error) => void) | undefined,
 }));
 
 vi.mock("../src/core/output-guard.js", () => ({
-	flushRawStdout: vi.fn(async () => {}),
+	flushRawStdout: rpcIo.flushRawStdout,
+	registerRawStdoutFailureHandler: vi.fn((handler: (error: Error) => void) => {
+		rpcIo.rawStdoutFailureHandler = handler;
+		return () => {
+			if (rpcIo.rawStdoutFailureHandler === handler) rpcIo.rawStdoutFailureHandler = undefined;
+		};
+	}),
 	takeOverStdout: vi.fn(),
 	waitForRawStdoutBackpressure: vi.fn(async () => {}),
 	writeRawStdout: (line: string) => rpcIo.outputLines.push(line),
 }));
 
 vi.mock("../src/modes/interactive/theme/theme.js", () => ({ theme: {} }));
+
+function requestExtensionShutdown(bindings: ExtensionBindings | undefined): void {
+	if (!bindings?.shutdownHandler) throw new Error("Missing extension shutdown handler");
+	bindings.shutdownHandler();
+}
+
+function failRawStdout(error: Error): void {
+	const handler = rpcIo.rawStdoutFailureHandler;
+	if (!handler) throw new Error("Missing raw stdout failure handler");
+	handler(error);
+}
 
 function parseOutput(): Array<Record<string, unknown>> {
 	return rpcIo.outputLines
@@ -74,6 +93,8 @@ async function waitForReady(): Promise<void> {
 describe("RPC startup lifecycle", () => {
 	it("emits ready only after session_start and accepts correlated startup host/UI responses", async () => {
 		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
 		const input = new PassThrough();
 		const lifecycle: string[] = [];
 		let hostResult: unknown;
@@ -128,6 +149,8 @@ describe("RPC startup lifecycle", () => {
 
 	it("rejects and never executes pre-ready commands, including a final unterminated record, before EOF cleanup", async () => {
 		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
 		const input = new PassThrough();
 		const lifecycle: string[] = [];
 		let releaseStartup: (() => void) | undefined;
@@ -180,6 +203,8 @@ describe("RPC startup lifecycle", () => {
 
 	it("a startup SIGTERM executes no pre-ready work, emits no ready, and exits once with 143", async () => {
 		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
 		const input = new PassThrough();
 		const signalSource = new EventEmitter();
 		let releaseStartup: (() => void) | undefined;
@@ -223,6 +248,8 @@ describe("RPC startup lifecycle", () => {
 
 	it("keeps get_state and abort_bash responsive while a ready-session bash is pending", async () => {
 		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
 		const input = new PassThrough();
 		let finishBash: ((result: object) => void) | undefined;
 		let observeBashStart: (() => void) | undefined;
@@ -269,6 +296,8 @@ describe("RPC startup lifecycle", () => {
 
 	it("starts ready-session EOF disposal without waiting for an in-flight bash", async () => {
 		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
 		const input = new PassThrough();
 		let finishBash: ((result: object) => void) | undefined;
 		let observeBashStart: (() => void) | undefined;
@@ -307,6 +336,8 @@ describe("RPC startup lifecycle", () => {
 
 	it("joins synchronous and repeated shutdown requests until cleanup completes", async () => {
 		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
 		const input = new PassThrough();
 		const signalSource = new EventEmitter();
 		let releaseDispose: (() => void) | undefined;
@@ -337,5 +368,205 @@ describe("RPC startup lifecycle", () => {
 		expect(lifecycle).toEqual(["shutdown-start", "shutdown-done"]);
 		expect(exitCodes).toEqual([143]);
 		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
+	});
+
+	it("finishes startup binding without ready when an extension requests shutdown", async () => {
+		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
+		const input = new PassThrough();
+		const lifecycle: string[] = [];
+		const session = createStateSession(async (bindings) => {
+			lifecycle.push("bind-start");
+			requestExtensionShutdown(bindings);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			lifecycle.push("bind-done");
+		});
+		const runtimeHost = {
+			session,
+			setRebindSession: vi.fn(),
+			dispose: vi.fn(async () => lifecycle.push("session_shutdown")),
+		} as unknown as AgentSessionRuntime;
+		const { exited } = startRpcMode(runtimeHost, input);
+
+		await expect(exited).resolves.toBe(0);
+		expect(lifecycle).toEqual(["bind-start", "bind-done", "session_shutdown"]);
+		expect(parseOutput().some((line) => line.type === "rpc_ready")).toBe(false);
+		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
+	});
+
+	it("waits for every concurrent command response after a user_bash hook requests shutdown", async () => {
+		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
+		const input = new PassThrough();
+		let bindings: ExtensionBindings | undefined;
+		let releaseLongBash: (() => void) | undefined;
+		const longBashGate = new Promise<void>((resolve) => {
+			releaseLongBash = resolve;
+		});
+		let observeLongBash: (() => void) | undefined;
+		const longBashStarted = new Promise<void>((resolve) => {
+			observeLongBash = resolve;
+		});
+		const lifecycle: string[] = [];
+		const session = Object.assign(
+			createStateSession(async (nextBindings) => {
+				bindings = nextBindings;
+			}),
+			{
+				extensionRunner: {
+					getRegisteredCommands: () => [],
+					emitUserBash: async ({ command }: { command: string }) => {
+						if (command === "request-shutdown") requestExtensionShutdown(bindings);
+						return undefined;
+					},
+				},
+				sessionManager: { getCwd: () => process.cwd() },
+				executeBash: async (command: string) => {
+					if (command === "long-running") {
+						observeLongBash?.();
+						await longBashGate;
+					}
+					return { output: `${command}\n`, exitCode: 0, cancelled: false, truncated: false };
+				},
+			},
+		);
+		const runtimeHost = {
+			session,
+			setRebindSession: vi.fn(),
+			dispose: vi.fn(async () => lifecycle.push("session_shutdown")),
+		} as unknown as AgentSessionRuntime;
+		const { exited } = startRpcMode(runtimeHost, input);
+		await waitForReady();
+
+		input.write('{"type":"bash","id":"long","command":"long-running"}\n');
+		await longBashStarted;
+		input.write('{"type":"bash","id":"shutdown","command":"request-shutdown"}\n');
+		await vi.waitFor(() => expect(parseOutput().some((line) => line.id === "shutdown")).toBe(true));
+		expect(parseOutput().some((line) => line.id === "long")).toBe(false);
+		expect(runtimeHost.dispose).not.toHaveBeenCalled();
+
+		releaseLongBash?.();
+		await vi.waitFor(() => expect(parseOutput().some((line) => line.id === "long")).toBe(true));
+		await expect(exited).resolves.toBe(0);
+		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
+		expect(lifecycle).toEqual(["session_shutdown"]);
+	});
+
+	it("writes an extension command response before its deferred shutdown", async () => {
+		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
+		const input = new PassThrough();
+		let bindings: ExtensionBindings | undefined;
+		const lifecycle: string[] = [];
+		const session = Object.assign(
+			createStateSession(async (nextBindings) => {
+				bindings = nextBindings;
+			}),
+			{
+				prompt: async (_message: string, options: { preflightResult: (success: boolean) => void }) => {
+					options.preflightResult(true);
+					requestExtensionShutdown(bindings);
+				},
+			},
+		);
+		const runtimeHost = {
+			session,
+			setRebindSession: vi.fn(),
+			dispose: vi.fn(async () => lifecycle.push("session_shutdown")),
+		} as unknown as AgentSessionRuntime;
+		const { exited } = startRpcMode(runtimeHost, input);
+		await waitForReady();
+
+		input.write('{"type":"prompt","id":"command","message":"/shutdown-test"}\n');
+		await expect(exited).resolves.toBe(0);
+		expect(parseOutput()).toContainEqual({ id: "command", type: "response", command: "prompt", success: true });
+		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
+		expect(lifecycle).toEqual(["session_shutdown"]);
+	});
+
+	it("waits for agent_settled after a tool requests shutdown", async () => {
+		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
+		const input = new PassThrough();
+		let bindings: ExtensionBindings | undefined;
+		let sessionEventHandler: ((event: { type: string }) => void) | undefined;
+		const session = Object.assign(
+			createStateSession(async (nextBindings) => {
+				bindings = nextBindings;
+			}),
+			{
+				isStreaming: true,
+				subscribe: (handler: (event: { type: string }) => void) => {
+					sessionEventHandler = handler;
+					return () => {};
+				},
+			},
+		);
+		const runtimeHost = {
+			session,
+			setRebindSession: vi.fn(),
+			dispose: vi.fn(async () => {}),
+		} as unknown as AgentSessionRuntime;
+		const { exited } = startRpcMode(runtimeHost, input);
+		await waitForReady();
+
+		requestExtensionShutdown(bindings);
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		expect(runtimeHost.dispose).not.toHaveBeenCalled();
+		session.isStreaming = false;
+		sessionEventHandler?.({ type: "agent_settled" });
+		await expect(exited).resolves.toBe(0);
+		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
+	});
+
+	it("routes raw stdout failure through one nonzero shutdown without flushing", async () => {
+		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
+		const input = new PassThrough();
+		const session = createStateSession(async () => {});
+		const runtimeHost = {
+			session,
+			setRebindSession: vi.fn(),
+			dispose: vi.fn(async () => {}),
+		} as unknown as AgentSessionRuntime;
+		const { exited, exitCodes } = startRpcMode(runtimeHost, input);
+		await waitForReady();
+
+		failRawStdout(new Error("broken pipe"));
+		await expect(exited).resolves.toBe(1);
+		expect(exitCodes).toEqual([1]);
+		expect(runtimeHost.dispose).toHaveBeenCalledOnce();
+		expect(rpcIo.flushRawStdout).not.toHaveBeenCalled();
+	});
+
+	it("does not let a late stdout close change an in-progress normal shutdown status", async () => {
+		rpcIo.outputLines = [];
+		rpcIo.flushRawStdout.mockClear();
+		rpcIo.rawStdoutFailureHandler = undefined;
+		const input = new PassThrough();
+		let releaseDispose: (() => void) | undefined;
+		const disposeGate = new Promise<void>((resolve) => {
+			releaseDispose = resolve;
+		});
+		const session = createStateSession(async () => {});
+		const runtimeHost = {
+			session,
+			setRebindSession: vi.fn(),
+			dispose: vi.fn(async () => disposeGate),
+		} as unknown as AgentSessionRuntime;
+		const { exited, exitCodes } = startRpcMode(runtimeHost, input);
+		await waitForReady();
+
+		input.end();
+		await vi.waitFor(() => expect(runtimeHost.dispose).toHaveBeenCalledOnce());
+		failRawStdout(new Error("late close"));
+		releaseDispose?.();
+		await expect(exited).resolves.toBe(0);
+		expect(exitCodes).toEqual([0]);
 	});
 });

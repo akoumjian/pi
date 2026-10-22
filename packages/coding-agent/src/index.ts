@@ -362,6 +362,7 @@ export {
 	type RpcExtensionUIResponse,
 	type RpcHostRequestContext,
 	type RpcHostRequestHandler,
+	type RpcReadyMessage,
 	type RpcResponse,
 	type RpcSessionState,
 	runPrintMode,

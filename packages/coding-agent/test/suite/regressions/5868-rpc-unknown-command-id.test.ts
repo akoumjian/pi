@@ -12,6 +12,7 @@ const rpcIo = vi.hoisted(() => ({
 
 vi.mock("../../../src/core/output-guard.js", () => ({
 	flushRawStdout: vi.fn(async () => {}),
+	registerRawStdoutFailureHandler: vi.fn(() => () => {}),
 	takeOverStdout: vi.fn(),
 	waitForRawStdoutBackpressure: vi.fn(async () => {}),
 	writeRawStdout: (line: string) => {
@@ -93,6 +94,7 @@ describe("RPC unknown command responses (#5868)", () => {
 		try {
 			void runRpcMode(createRuntimeHost(harness));
 			await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+			await vi.waitFor(() => expect(parseOutputLines()).toContainEqual({ type: "rpc_ready" }));
 
 			rpcIo.lineHandler?.(JSON.stringify({ id: "test", type: "foobar" }));
 

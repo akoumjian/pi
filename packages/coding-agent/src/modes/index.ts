@@ -20,6 +20,7 @@ export type {
 	RpcExtensionHostResponse,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
+	RpcReadyMessage,
 	RpcResponse,
 	RpcSessionState,
 } from "./rpc/rpc-types.ts";

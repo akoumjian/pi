@@ -23,6 +23,7 @@ import type {
 } from "../../core/extensions/index.ts";
 import {
 	flushRawStdout,
+	registerRawStdoutFailureHandler,
 	takeOverStdout,
 	waitForRawStdoutBackpressure,
 	writeRawStdout,
@@ -109,6 +110,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 	let lifecycleState: RpcLifecycleState = "starting";
 	const isClosing = (): boolean => lifecycleState === "closing" || lifecycleState === "closed";
+	let extensionShutdownRequested = false;
+	let activeCommandExecutions = 0;
+	let rawStdoutFailed = false;
+	let removeRawStdoutFailureHandler = () => {};
 	let shutdownPromise: Promise<void> | undefined;
 	let shutdownExitCode = 0;
 	let shutdownSignal: NodeJS.Signals | undefined;
@@ -387,7 +392,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				},
 			},
 			shutdownHandler: () => {
-				void shutdown();
+				extensionShutdownRequested = true;
+				maybeShutdownAfterExtensionRequest();
 			},
 			onError: (err) => {
 				output({ type: "extension_error", extensionPath: err.extensionPath, event: err.event, error: err.error });
@@ -399,6 +405,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		unsubscribeBackpressure?.();
 		unsubscribe = session.subscribe((event) => {
 			output(toJsonEvent(event));
+			if (event.type === "agent_settled") maybeShutdownAfterExtensionRequest();
 		});
 		unsubscribeBackpressure = session.agent.subscribe(async () => {
 			await waitForRawStdoutBackpressure();
@@ -431,27 +438,20 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 			// =================================================================
 
 			case "prompt": {
-				// Start prompt handling immediately, but emit the authoritative response only after
-				// prompt preflight succeeds. Queued and immediately handled prompts also count as success.
-				let preflightSucceeded = false;
-				void session
-					.prompt(command.message, {
-						images: command.images,
-						streamingBehavior: command.streamingBehavior,
-						source: "rpc",
-						preflightResult: (didSucceed) => {
-							if (didSucceed) {
-								preflightSucceeded = true;
-								output(success(id, "prompt"));
-							}
-						},
-					})
-					.catch((e) => {
-						if (!preflightSucceeded) {
-							output(error(id, "prompt", e.message));
-						}
-					});
-				return undefined;
+				// Keep this command execution active through prompt preflight so graceful extension
+				// shutdown cannot overtake its authoritative response. Agent streaming remains async.
+				return await new Promise<RpcResponse>((resolve, reject) => {
+					void session
+						.prompt(command.message, {
+							images: command.images,
+							streamingBehavior: command.streamingBehavior,
+							source: "rpc",
+							preflightResult: (didSucceed) => {
+								if (didSucceed) resolve(success(id, "prompt"));
+							},
+						})
+						.catch(reject);
+				});
 			}
 
 			case "steer": {
@@ -760,6 +760,19 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 	let detachInput = () => {};
 
+	function maybeShutdownAfterExtensionRequest(): void {
+		if (
+			!extensionShutdownRequested ||
+			lifecycleState !== "ready" ||
+			activeCommandExecutions !== 0 ||
+			session.isStreaming ||
+			session.isCompacting
+		) {
+			return;
+		}
+		void shutdown();
+	}
+
 	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
 		if (signal !== undefined) {
 			shutdownExitCode = exitCode;
@@ -786,16 +799,26 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				await runtimeHost.dispose();
 			} finally {
 				try {
-					if (shutdownSignal !== "SIGTERM") await flushRawStdout();
+					if (!rawStdoutFailed && shutdownSignal !== "SIGTERM") await flushRawStdout();
 				} finally {
 					lifecycleState = "closed";
+					removeRawStdoutFailureHandler();
 					for (const cleanup of signalCleanupHandlers.splice(0)) cleanup();
-					exit(shutdownExitCode);
+					try {
+						killTrackedDetachedChildren();
+					} finally {
+						exit(shutdownExitCode);
+					}
 				}
 			}
 		})().then(resolveShutdown!, rejectShutdown!);
 		return shutdownPromise;
 	}
+
+	removeRawStdoutFailureHandler = registerRawStdoutFailureHandler(() => {
+		rawStdoutFailed = true;
+		if (!isClosing()) void shutdown(1);
+	});
 
 	const handleExtensionResponse = (parsed: unknown, line: string): boolean => {
 		if (typeof parsed !== "object" || parsed === null || !("type" in parsed)) return false;
@@ -860,6 +883,16 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 
+	const dispatchCommand = async (line: string): Promise<void> => {
+		activeCommandExecutions++;
+		try {
+			await handleInputLine(line);
+		} finally {
+			activeCommandExecutions--;
+			maybeShutdownAfterExtensionRequest();
+		}
+	};
+
 	const onInputEnd = () => {
 		void shutdown();
 	};
@@ -879,7 +912,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				rejectCommandBeforeReady(parsed);
 				return;
 			}
-			void handleInputLine(line);
+			void dispatchCommand(line);
 		});
 		// Register after the reader so its final unterminated line is classified before EOF shutdown.
 		input.on("end", onInputEnd);
@@ -897,6 +930,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	}
 	if (lifecycleState !== "starting") {
 		await shutdownPromise?.catch(() => {});
+		return new Promise(() => {});
+	}
+	if (extensionShutdownRequested) {
+		await shutdown();
 		return new Promise(() => {});
 	}
 	lifecycleState = "ready";

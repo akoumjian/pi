@@ -17,11 +17,14 @@ Common options:
 - `--no-session`: Disable session persistence
 - `--session-dir <path>`: Custom session storage directory
 
+After starting Pi, clients must read stdout until they receive the exact `{"type":"rpc_ready"}` record before sending ordinary commands. During startup, only correlated extension host/UI responses are accepted; ordinary commands fail with `RPC session is not ready` and are not replayed. `RpcClient.start()` implements this handshake.
+
 ## Protocol Overview
 
 - **Commands**: JSON objects sent to stdin, one per line
 - **Responses**: JSON objects with `type: "response"` indicating command success/failure
 - **Events**: Agent events streamed to stdout as JSON lines
+- **Readiness**: Wait for the exact `{"type":"rpc_ready"}` record before sending ordinary commands
 
 All commands support an optional `id` field for request/response correlation. If provided, the corresponding response will include the same `id`. `bash_execution_update` events also include the `id` of their originating `bash` command.
 
@@ -1387,7 +1390,9 @@ During `STARTING`, Pi processes only correlated `extension_host_response` and `e
 
 In `READY`, ordinary commands dispatch concurrently. This keeps state queries, abort commands, and reentrant host callbacks responsive while another command is long-running.
 
-EOF, explicit stop, signal, or extension shutdown transitions immediately to `CLOSING`, revokes host/UI requests, detaches input, discards unread work, and joins one idempotent runtime-disposal path. No ordinary command is admitted after closing begins, including commands received during startup. In-flight commands may be interrupted; callers that need completion must keep stdin open and wait for their correlated response. `session_shutdown` gets one cleanup opportunity, after which the process enters `CLOSED`. A signal received during cleanup supplies the final signal exit status without starting a second cleanup.
+EOF, explicit stop, signal, or stdout loss transitions immediately to `CLOSING`, revokes host/UI requests, detaches input, discards unread work, and joins one idempotent runtime-disposal path. No ordinary command is admitted after closing begins, including commands received during startup. In-flight commands may be interrupted; callers that need completion must keep stdin open and wait for their correlated response. Broken stdout skips further writes and exits nonzero when it initiated closing. `session_shutdown` gets one cleanup opportunity, tracked detached children are terminated before exit, and a signal received during cleanup supplies the final signal exit status without starting a second cleanup.
+
+Extension `ctx.shutdown()` remains graceful rather than cancellation-first. During startup, Pi completes extension binding, emits no readiness record, and then shuts down. After readiness, Pi waits until every active RPC command has completed its response and the agent is idle, then joins the same cleanup path.
 
 ## Extension Host Request Protocol
 
