@@ -58,12 +58,17 @@ export type {
 export interface RpcModeOptions {
 	input?: Readable;
 	exit?: (exitCode: number) => void;
+	signalSource?: {
+		on(signal: NodeJS.Signals, listener: () => void): unknown;
+		off(signal: NodeJS.Signals, listener: () => void): unknown;
+	};
 }
 
 export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcModeOptions = {}): Promise<never> {
 	takeOverStdout();
 	const input = options.input ?? process.stdin;
 	const exit = options.exit ?? process.exit;
+	const signalSource = options.signalSource ?? process;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeBackpressure: (() => void) | undefined;
@@ -98,7 +103,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 	// Shutdown request flag
 	let shutdownRequested = false;
-	let shuttingDown = false;
+	let shutdownPromise: Promise<void> | undefined;
+	let shutdownExitCode = 0;
+	let shutdownSignal: NodeJS.Signals | undefined;
 	let inputClosedError: Error | undefined;
 	const signalCleanupHandlers: Array<() => void> = [];
 
@@ -405,8 +412,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				killTrackedDetachedChildren();
 				void shutdown(signal === "SIGHUP" ? 129 : 143, signal);
 			};
-			process.on(signal, handler);
-			signalCleanupHandlers.push(() => process.off(signal, handler));
+			signalSource.on(signal, handler);
+			signalCleanupHandlers.push(() => signalSource.off(signal, handler));
 		}
 	};
 
@@ -754,24 +761,41 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 	let detachInput = () => {};
 	let inputReady = false;
 	let inputEnded = false;
-	let inputQueue = Promise.resolve();
 	const bufferedInputLines: string[] = [];
 
-	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
-		if (shuttingDown) {
-			exit(exitCode);
-			return;
+	function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<void> {
+		if (signal !== undefined) {
+			shutdownExitCode = exitCode;
+			shutdownSignal = signal;
+		} else if (shutdownSignal === undefined && exitCode !== 0) {
+			shutdownExitCode = exitCode;
 		}
-		shuttingDown = true;
-		for (const cleanup of signalCleanupHandlers) cleanup();
-		unsubscribe?.();
-		unsubscribeBackpressure?.();
-		closeInputRequests(new Error("RPC connection closed"));
-		await runtimeHost.dispose();
-		detachInput();
-		input.pause();
-		if (signal !== "SIGTERM") await flushRawStdout();
-		exit(exitCode);
+		if (shutdownPromise) return shutdownPromise;
+
+		let resolveShutdown: () => void;
+		let rejectShutdown: (error: unknown) => void;
+		shutdownPromise = new Promise<void>((resolve, reject) => {
+			resolveShutdown = resolve;
+			rejectShutdown = reject;
+		});
+		void (async () => {
+			try {
+				unsubscribe?.();
+				unsubscribeBackpressure?.();
+				closeInputRequests(new Error("RPC connection closed"));
+				detachInput();
+				input.pause();
+				await runtimeHost.dispose();
+			} finally {
+				try {
+					if (shutdownSignal !== "SIGTERM") await flushRawStdout();
+				} finally {
+					for (const cleanup of signalCleanupHandlers.splice(0)) cleanup();
+					exit(shutdownExitCode);
+				}
+			}
+		})().then(resolveShutdown!, rejectShutdown!);
+		return shutdownPromise;
 	}
 
 	async function checkShutdownRequested(): Promise<void> {
@@ -835,15 +859,11 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 		}
 	};
 
-	const enqueueInputLine = (line: string): void => {
-		inputQueue = inputQueue.then(() => handleInputLine(line));
-	};
-
 	const onInputEnd = () => {
 		if (inputEnded) return;
 		inputEnded = true;
 		closeInputRequests(new Error("RPC connection closed"));
-		if (inputReady) void inputQueue.then(() => shutdown());
+		if (inputReady) void shutdown();
 	};
 
 	detachInput = (() => {
@@ -854,7 +874,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 				// Preserve malformed input for normal parse-error handling.
 			}
 			if (inputReady) {
-				enqueueInputLine(line);
+				void handleInputLine(line);
 				return;
 			}
 			bufferedInputLines.push(line);
@@ -869,10 +889,10 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcM
 
 	registerSignalHandlers();
 	await rebindSession();
-	for (const line of bufferedInputLines.splice(0)) enqueueInputLine(line);
+	const startupDrain = bufferedInputLines.splice(0).map((line) => handleInputLine(line));
 	inputReady = true;
 	if (inputEnded) {
-		await inputQueue;
+		await Promise.allSettled(startupDrain);
 		await shutdown();
 	}
 
