@@ -72,6 +72,7 @@ import {
 	type ContextUsage,
 	type ExtensionCommandContextActions,
 	type ExtensionErrorListener,
+	type ExtensionHostRequestHandler,
 	type ExtensionMode,
 	ExtensionRunner,
 	type ExtensionUIContext,
@@ -234,6 +235,7 @@ export interface ExtensionBindings {
 	uiContext?: ExtensionUIContext;
 	mode?: ExtensionMode;
 	commandContextActions?: ExtensionCommandContextActions;
+	hostRequestHandler?: ExtensionHostRequestHandler;
 	abortHandler?: () => void;
 	shutdownHandler?: ShutdownHandler;
 	onError?: ExtensionErrorListener;
@@ -375,6 +377,7 @@ export class AgentSession {
 	private _extensionUIContext?: ExtensionUIContext;
 	private _extensionMode: ExtensionMode = "print";
 	private _extensionCommandContextActions?: ExtensionCommandContextActions;
+	private _extensionHostRequestHandler?: ExtensionHostRequestHandler;
 	private _extensionAbortHandler?: () => void;
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
@@ -2608,6 +2611,9 @@ export class AgentSession {
 		if (bindings.commandContextActions !== undefined) {
 			this._extensionCommandContextActions = bindings.commandContextActions;
 		}
+		if (bindings.hostRequestHandler !== undefined) {
+			this._extensionHostRequestHandler = bindings.hostRequestHandler;
+		}
 		if (bindings.abortHandler !== undefined) {
 			this._extensionAbortHandler = bindings.abortHandler;
 		}
@@ -2728,6 +2734,13 @@ export class AgentSession {
 
 		runner.bindCore(
 			{
+				requestHost: (service, payload, options) => {
+					const handler = this._extensionHostRequestHandler;
+					if (!handler) {
+						return Promise.reject(new Error("Host requests are only available in RPC mode."));
+					}
+					return handler(service, payload, options);
+				},
 				sendMessage: (message, options) => {
 					this.sendCustomMessage(message, options).catch((err) => {
 						runner.emitError({

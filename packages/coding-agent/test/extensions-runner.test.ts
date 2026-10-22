@@ -72,6 +72,7 @@ describe("ExtensionRunner", () => {
 	};
 
 	const extensionActions: ExtensionActions = {
+		requestHost: async () => null,
 		sendMessage: () => {},
 		sendUserMessage: () => {},
 		appendEntry: () => {},

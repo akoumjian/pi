@@ -1373,6 +1373,56 @@ Dismiss any dialog method. The extension receives `undefined` (for select/input/
 {"type": "extension_ui_response", "id": "uuid-3", "cancelled": true}
 ```
 
+## Extension Host Request Protocol
+
+RPC-mode extensions can make bounded, service-neutral requests to the embedding host with `pi.requestHost()`. This is separate from extension UI: it carries application data, has correlated success/failure responses, and is unavailable outside RPC mode.
+
+Extension to host (stdout):
+
+```json
+{"type":"extension_host_request","id":"550e8400-e29b-41d4-a716-446655440000","service":"example.lookup","payload":{"key":"value"}}
+```
+
+Host to extension (stdin), success:
+
+```json
+{"type":"extension_host_response","id":"550e8400-e29b-41d4-a716-446655440000","success":true,"data":{"found":true}}
+```
+
+Host to extension (stdin), failure:
+
+```json
+{"type":"extension_host_response","id":"550e8400-e29b-41d4-a716-446655440000","success":false,"error":"lookup failed"}
+```
+
+The request contract is intentionally narrow:
+
+- Service names must match `^[a-z][a-z0-9._-]{0,127}$`.
+- Correlation IDs are UUIDs and cannot exceed 128 bytes.
+- `payload` and successful response `data` must be JSON-compatible values.
+- Each serialized request or response line is limited to 256 KiB.
+- An RPC process can have at most 16 pending extension host requests.
+- Extension requests default to a 30-second timeout. A caller can select a positive integer timeout up to 120 seconds and can provide an `AbortSignal`.
+- Failure text is limited to 2 KiB.
+- Unknown, duplicate, and late responses do not affect another request.
+- Pending requests are rejected when the RPC transport closes.
+
+`RpcClient` dispatches requests by exact service name:
+
+```typescript
+const client = new RpcClient({
+  hostRequestHandlers: {
+    "example.lookup": async (payload, { signal }) => {
+      signal.throwIfAborted();
+      const { key } = payload as { key: string };
+      return { found: key === "value" };
+    },
+  },
+});
+```
+
+Handler results must be JSON-compatible. Missing handlers, thrown errors, invalid results, and oversized results become bounded failure responses. Handler signals are aborted when the child process exits or the client stops.
+
 ## Error Handling
 
 Failed commands return a response with `success: false`:

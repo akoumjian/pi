@@ -35,4 +35,49 @@ process.stdin.resume();
 
 		await expect(client.getCommands()).rejects.toThrow(/Agent process exited \(code=43 signal=null\)/);
 	});
+
+	test("aborts an active host handler when the child process exits", async () => {
+		let observeAbort: (() => void) | undefined;
+		const aborted = new Promise<void>((resolve) => {
+			observeAbort = resolve;
+		});
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+process.stdout.write(JSON.stringify({
+  type: "extension_host_request",
+  id: "123e4567-e89b-42d3-a456-426614174000",
+  service: "wait",
+  payload: null
+}) + "\\n");
+setTimeout(() => process.exit(44), 25);
+`),
+			hostRequestHandlers: {
+				wait: (_payload, { signal }) =>
+					new Promise((resolve) => {
+						signal.addEventListener("abort", () => {
+							observeAbort?.();
+							resolve(null);
+						});
+					}),
+			},
+		});
+
+		await expect(client.start()).rejects.toThrow(/Agent process exited \(code=44 signal=null\)/);
+		await expect(aborted).resolves.toBeUndefined();
+	});
+	test("rejects pending work on an RPC stdin error", async () => {
+		const client = new RpcClient({
+			cliPath: writeChildScript(`
+process.stdin.on("end", () => process.exit(0));
+process.stdin.resume();
+`),
+		});
+		await client.start();
+		const pending = client.getCommands();
+		const child = (client as unknown as { process: import("node:child_process").ChildProcess }).process;
+		child.stdin!.emit("error", new Error("synthetic stdin failure"));
+
+		await expect(pending).rejects.toThrow("Agent process stdin error: synthetic stdin failure");
+		await client.stop();
+	});
 });

@@ -1358,6 +1358,22 @@ export default function (pi: ExtensionAPI) {
 
 ## ExtensionAPI Methods
 
+### pi.requestHost(service, payload, options?)
+
+Send a correlated, service-neutral request to the embedding host. This API is available only in RPC mode and rejects in interactive, JSON, and print modes. Call it from `session_start` or later, not from the extension factory, because the RPC transport is bound after extensions load.
+
+```typescript
+const result = await pi.requestHost<{ accepted: boolean }>(
+  "example.submit",
+  { value: 42 },
+  { timeout: 10_000, signal: ctx.signal },
+);
+```
+
+`service` must match `^[a-z][a-z0-9._-]{0,127}$`. The payload and response must be JSON-compatible. Requests default to a 30-second timeout; `timeout` is in milliseconds and can be at most 120 seconds. At most 16 requests may be pending, and each serialized protocol line is limited to 256 KiB. Aborting or timing out rejects locally; any later response is ignored.
+
+The RPC host registers handlers through `RpcClient.hostRequestHandlers`. Pi does not assign meaning to service names or payloads. See [RPC Mode](rpc.md#extension-host-request-protocol) for the wire format and complete limits.
+
 ### pi.on(event, handler)
 
 Subscribe to events. See [Events](#events) for event types and return values.

@@ -189,6 +189,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	};
 
 	const runtime: ExtensionRuntime = {
+		requestHost: () => Promise.reject(new Error("Host requests are only available in RPC mode after session start.")),
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,
@@ -359,6 +360,11 @@ function createExtensionAPI(
 		},
 
 		// Action methods - delegate to shared runtime
+		requestHost(service, payload, options) {
+			assertActive();
+			return runtime.requestHost(service, payload, options);
+		},
+
 		sendMessage(message, options): void {
 			assertActive();
 			runtime.sendMessage(message, options);

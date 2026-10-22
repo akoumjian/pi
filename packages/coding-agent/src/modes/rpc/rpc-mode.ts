@@ -28,6 +28,7 @@ import {
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { type Theme, theme } from "../interactive/theme/theme.ts";
 import { toJsonEvent } from "../json-event.ts";
+import { RpcExtensionHostTransport } from "./extension-host-transport.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
 import type {
 	RpcCommand,
@@ -41,6 +42,8 @@ import type {
 // Re-export types for consumers
 export type {
 	RpcCommand,
+	RpcExtensionHostRequest,
+	RpcExtensionHostResponse,
 	RpcExtensionUIRequest,
 	RpcExtensionUIResponse,
 	RpcResponse,
@@ -60,6 +63,9 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	const output = (obj: RpcResponse | RpcExtensionUIRequest | object) => {
 		writeRawStdout(serializeJsonLine(obj));
 	};
+	const hostTransport = new RpcExtensionHostTransport((line) => {
+		writeRawStdout(line);
+	});
 
 	const success = <T extends RpcCommand["type"]>(
 		id: string | undefined,
@@ -319,6 +325,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		await session.bindExtensions({
 			uiContext: createExtensionUIContext(),
 			mode: "rpc",
+			hostRequestHandler: (service, payload, options) => hostTransport.request(service, payload, options),
 			commandContextActions: {
 				waitForIdle: () => session.waitForIdle(),
 				newSession: async (options) => runtimeHost.newSession(options),
@@ -378,9 +385,6 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			signalCleanupHandlers.push(() => process.off(signal, handler));
 		}
 	};
-
-	await rebindSession();
-	registerSignalHandlers();
 
 	// Handle a single command
 	const handleCommand = async (command: RpcCommand): Promise<RpcResponse | undefined> => {
@@ -724,6 +728,8 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 	 * Called after handling each command when waiting for the next command.
 	 */
 	let detachInput = () => {};
+	let inputReady = false;
+	const bufferedInputLines: string[] = [];
 
 	async function shutdown(exitCode = 0, signal?: NodeJS.Signals): Promise<never> {
 		if (shuttingDown) {
@@ -735,6 +741,12 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		}
 		unsubscribe?.();
 		unsubscribeBackpressure?.();
+		const shutdownError = new Error("RPC connection closed");
+		hostTransport.close(shutdownError);
+		for (const pending of pendingExtensionRequests.values()) {
+			pending.reject(shutdownError);
+		}
+		pendingExtensionRequests.clear();
 		await runtimeHost.dispose();
 		detachInput();
 		process.stdin.pause();
@@ -748,6 +760,24 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 		if (!shutdownRequested) return;
 		await shutdown();
 	}
+
+	const handleExtensionResponse = (parsed: unknown, line: string): boolean => {
+		if (typeof parsed !== "object" || parsed === null || !("type" in parsed)) return false;
+		if (parsed.type === "extension_host_response") {
+			hostTransport.handleResponse(parsed, Buffer.byteLength(line) + 1);
+			return true;
+		}
+		if (parsed.type === "extension_ui_response") {
+			const response = parsed as RpcExtensionUIResponse;
+			const pending = pendingExtensionRequests.get(response.id);
+			if (pending) {
+				pendingExtensionRequests.delete(response.id);
+				pending.resolve(response);
+			}
+			return true;
+		}
+		return false;
+	};
 
 	const handleInputLine = async (line: string) => {
 		let parsed: unknown;
@@ -765,21 +795,7 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 			return;
 		}
 
-		// Handle extension UI responses
-		if (
-			typeof parsed === "object" &&
-			parsed !== null &&
-			"type" in parsed &&
-			parsed.type === "extension_ui_response"
-		) {
-			const response = parsed as RpcExtensionUIResponse;
-			const pending = pendingExtensionRequests.get(response.id);
-			if (pending) {
-				pendingExtensionRequests.delete(response.id);
-				pending.resolve(response);
-			}
-			return;
-		}
+		if (handleExtensionResponse(parsed, line)) return;
 
 		const command = parsed as RpcCommand;
 		try {
@@ -808,13 +824,29 @@ export async function runRpcMode(runtimeHost: AgentSessionRuntime): Promise<neve
 
 	detachInput = (() => {
 		const detachJsonl = attachJsonlLineReader(process.stdin, (line) => {
-			void handleInputLine(line);
+			if (inputReady) {
+				void handleInputLine(line);
+				return;
+			}
+			try {
+				if (handleExtensionResponse(JSON.parse(line), line)) return;
+			} catch {
+				// Preserve malformed input for normal parse-error handling after startup.
+			}
+			bufferedInputLines.push(line);
 		});
 		return () => {
 			detachJsonl();
 			process.stdin.off("end", onInputEnd);
 		};
 	})();
+
+	registerSignalHandlers();
+	await rebindSession();
+	inputReady = true;
+	for (const line of bufferedInputLines.splice(0)) {
+		void handleInputLine(line);
+	}
 
 	// Keep process alive forever
 	return new Promise(() => {});

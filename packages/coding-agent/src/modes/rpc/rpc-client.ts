@@ -6,14 +6,30 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent } from "@earendil-works/pi-ai";
+import type { ImageContent, JsonValue } from "@earendil-works/pi-ai";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
 import type { SessionEntry, SessionTreeNode } from "../../core/session-manager.ts";
 import type { JsonAgentSessionEvent } from "../json-event.ts";
+import {
+	boundedRpcHostError,
+	isJsonValue,
+	isRpcHostCorrelationId,
+	isRpcHostService,
+	RPC_HOST_MAX_LINE_BYTES,
+	RPC_HOST_MAX_PENDING_REQUESTS,
+	serializeRpcHostMessage,
+} from "./extension-host-transport.ts";
 import { attachJsonlLineReader, serializeJsonLine } from "./jsonl.ts";
-import type { RpcCommand, RpcResponse, RpcSessionState, RpcSlashCommand } from "./rpc-types.ts";
+import type {
+	RpcCommand,
+	RpcExtensionHostRequest,
+	RpcExtensionHostResponse,
+	RpcResponse,
+	RpcSessionState,
+	RpcSlashCommand,
+} from "./rpc-types.ts";
 
 // ============================================================================
 // Types
@@ -24,6 +40,17 @@ type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : n
 
 /** RpcCommand without the id field (for internal send) */
 type RpcCommandBody = DistributiveOmit<RpcCommand, "id">;
+
+export interface RpcHostRequestContext {
+	id: string;
+	service: string;
+	signal: AbortSignal;
+}
+
+export type RpcHostRequestHandler = (
+	payload: JsonValue,
+	context: RpcHostRequestContext,
+) => JsonValue | Promise<JsonValue>;
 
 export interface RpcClientOptions {
 	/** Path to the CLI entry point (default: searches for dist/cli.js) */
@@ -38,6 +65,8 @@ export interface RpcClientOptions {
 	model?: string;
 	/** Additional CLI arguments */
 	args?: string[];
+	/** Service-neutral handlers for RPC extension host requests. */
+	hostRequestHandlers?: Readonly<Record<string, RpcHostRequestHandler>>;
 }
 
 export interface ModelInfo {
@@ -63,9 +92,17 @@ export class RpcClient {
 	private stderr = "";
 	private exitError: Error | null = null;
 	private options: RpcClientOptions;
+	private hostRequestHandlers = new Map<string, RpcHostRequestHandler>();
+	private activeHostRequests = new Map<string, AbortController>();
+	private stopping = false;
+	private stopPromise: Promise<void> | null = null;
 
 	constructor(options: RpcClientOptions = {}) {
 		this.options = options;
+		for (const [service, handler] of Object.entries(options.hostRequestHandlers ?? {})) {
+			if (!isRpcHostService(service)) throw new Error(`Invalid host service: ${service}`);
+			this.hostRequestHandlers.set(service, handler);
+		}
 	}
 
 	/**
@@ -77,6 +114,8 @@ export class RpcClient {
 		}
 
 		this.exitError = null;
+		this.stderr = "";
+		this.stopping = false;
 
 		const cliPath = this.options.cliPath ?? "dist/cli.js";
 		const args = ["--mode", "rpc"];
@@ -106,14 +145,16 @@ export class RpcClient {
 
 		childProcess.once("exit", (code, signal) => {
 			if (this.process !== childProcess) return;
-			const error = this.createProcessExitError(code, signal);
+			const error = this.stopping ? new Error("RPC client stopped") : this.createProcessExitError(code, signal);
 			this.exitError = error;
+			this.abortHostRequests();
 			this.rejectPendingRequests(error);
 		});
 		childProcess.once("error", (error) => {
 			if (this.process !== childProcess) return;
 			const processError = new Error(`Agent process error: ${error.message}. Stderr: ${this.stderr}`);
 			this.exitError = processError;
+			this.abortHostRequests();
 			this.rejectPendingRequests(processError);
 		});
 		childProcess.stdin?.on("error", (error) => {
@@ -121,6 +162,7 @@ export class RpcClient {
 			const stdinError =
 				this.exitError ?? new Error(`Agent process stdin error: ${error.message}. Stderr: ${this.stderr}`);
 			this.exitError = stdinError;
+			this.abortHostRequests();
 			this.rejectPendingRequests(stdinError);
 		});
 
@@ -132,7 +174,7 @@ export class RpcClient {
 		// Wait a moment for process to initialize
 		await new Promise((resolve) => setTimeout(resolve, 100));
 
-		if (this.process.exitCode !== null) {
+		if (this.exitError || this.process.exitCode !== null || this.process.signalCode !== null) {
 			const error = this.exitError ?? this.createProcessExitError(this.process.exitCode, this.process.signalCode);
 			this.exitError = error;
 			throw error;
@@ -141,29 +183,64 @@ export class RpcClient {
 
 	/**
 	 * Stop the RPC agent process.
+	 *
+	 * Closes RPC stdin first and allows five seconds for graceful session cleanup.
+	 * A stuck child receives SIGTERM, then SIGKILL after one more second.
 	 */
 	async stop(): Promise<void> {
-		if (!this.process) return;
+		if (this.stopPromise) return this.stopPromise;
+		const childProcess = this.process;
+		if (!childProcess) return;
+
+		this.stopPromise = this.stopProcess(childProcess).finally(() => {
+			this.stopPromise = null;
+		});
+		return this.stopPromise;
+	}
+
+	private async stopProcess(childProcess: ChildProcess): Promise<void> {
+		this.stopping = true;
+		this.abortHostRequests();
+
+		try {
+			if (childProcess.stdin && !childProcess.stdin.destroyed && !childProcess.stdin.writableEnded) {
+				childProcess.stdin.end();
+			}
+		} catch {
+			// Continue to bounded signal escalation below.
+		}
+
+		if (!(await this.waitForProcessExit(childProcess, 5000))) {
+			childProcess.kill("SIGTERM");
+			if (!(await this.waitForProcessExit(childProcess, 1000))) {
+				childProcess.kill("SIGKILL");
+				await this.waitForProcessExit(childProcess, 1000);
+			}
+		}
 
 		this.stopReadingStdout?.();
 		this.stopReadingStdout = null;
-		this.process.kill("SIGTERM");
+		if (this.process === childProcess) this.process = null;
+		const stoppedError = this.exitError ?? new Error("RPC client stopped");
+		this.exitError = stoppedError;
+		this.rejectPendingRequests(stoppedError);
+		this.stopping = false;
+	}
 
-		// Wait for process to exit
-		await new Promise<void>((resolve) => {
-			const timeout = setTimeout(() => {
-				this.process?.kill("SIGKILL");
-				resolve();
-			}, 1000);
-
-			this.process?.on("exit", () => {
+	private waitForProcessExit(childProcess: ChildProcess, timeoutMs: number): Promise<boolean> {
+		if (childProcess.exitCode !== null || childProcess.signalCode !== null) return Promise.resolve(true);
+		return new Promise((resolve) => {
+			const finish = (exited: boolean) => {
 				clearTimeout(timeout);
-				resolve();
-			});
+				childProcess.off("exit", onExit);
+				childProcess.off("error", onExit);
+				resolve(exited);
+			};
+			const onExit = () => finish(true);
+			const timeout = setTimeout(() => finish(false), timeoutMs);
+			childProcess.once("exit", onExit);
+			childProcess.once("error", onExit);
 		});
-
-		this.process = null;
-		this.pendingRequests.clear();
 	}
 
 	/**
@@ -515,10 +592,23 @@ export class RpcClient {
 
 	private handleLine(line: string): void {
 		try {
-			const data = JSON.parse(line);
+			const data: unknown = JSON.parse(line);
+
+			if (typeof data === "object" && data !== null && "type" in data && data.type === "extension_host_request") {
+				void this.handleHostRequest(data, Buffer.byteLength(line) + 1);
+				return;
+			}
 
 			// Check if it's a response to a pending request
-			if (data.type === "response" && data.id && this.pendingRequests.has(data.id)) {
+			if (
+				typeof data === "object" &&
+				data !== null &&
+				"type" in data &&
+				data.type === "response" &&
+				"id" in data &&
+				typeof data.id === "string" &&
+				this.pendingRequests.has(data.id)
+			) {
 				const pending = this.pendingRequests.get(data.id)!;
 				this.pendingRequests.delete(data.id);
 				pending.resolve(data as RpcResponse);
@@ -532,6 +622,90 @@ export class RpcClient {
 		} catch {
 			// Ignore non-JSON lines
 		}
+	}
+
+	private async handleHostRequest(value: unknown, lineBytes: number): Promise<void> {
+		if (this.stopping || this.exitError) return;
+		if (typeof value !== "object" || value === null || !("id" in value)) return;
+		const id = value.id;
+		if (!isRpcHostCorrelationId(id) || this.activeHostRequests.has(id)) return;
+
+		const fail = (error: unknown) => {
+			try {
+				this.writeHostResponse({
+					type: "extension_host_response",
+					id,
+					success: false,
+					error: boundedRpcHostError(error),
+				});
+			} catch {
+				// The stdin/process error path owns cleanup when a failure response cannot be written.
+			}
+		};
+		if (lineBytes > RPC_HOST_MAX_LINE_BYTES) {
+			fail(`RPC host request exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`);
+			return;
+		}
+		if (
+			!("service" in value) ||
+			!isRpcHostService(value.service) ||
+			!("payload" in value) ||
+			!isJsonValue(value.payload)
+		) {
+			fail("Malformed extension host request");
+			return;
+		}
+		if (this.activeHostRequests.size >= RPC_HOST_MAX_PENDING_REQUESTS) {
+			fail(`Too many active host requests (maximum ${RPC_HOST_MAX_PENDING_REQUESTS})`);
+			return;
+		}
+
+		const request = value as RpcExtensionHostRequest;
+		const handler = this.hostRequestHandlers.get(request.service);
+		if (!handler) {
+			fail(`No host handler registered for service: ${request.service}`);
+			return;
+		}
+
+		const controller = new AbortController();
+		this.activeHostRequests.set(id, controller);
+		try {
+			const data = await handler(request.payload, { id, service: request.service, signal: controller.signal });
+			if (controller.signal.aborted) return;
+			if (!isJsonValue(data)) throw new Error("Host handler result must be JSON-compatible");
+			const response: RpcExtensionHostResponse = { type: "extension_host_response", id, success: true, data };
+			try {
+				this.writeHostResponse(response);
+			} catch {
+				fail(`RPC host response exceeds ${RPC_HOST_MAX_LINE_BYTES} bytes`);
+			}
+		} catch (error) {
+			if (!controller.signal.aborted) fail(error);
+		} finally {
+			if (this.activeHostRequests.get(id) === controller) this.activeHostRequests.delete(id);
+		}
+	}
+
+	private writeHostResponse(response: RpcExtensionHostResponse): void {
+		const childProcess = this.process;
+		const stdin = childProcess?.stdin;
+		if (
+			!childProcess ||
+			!stdin ||
+			childProcess.exitCode !== null ||
+			childProcess.signalCode !== null ||
+			stdin.destroyed ||
+			stdin.writableEnded ||
+			!stdin.writable
+		) {
+			return;
+		}
+		stdin.write(serializeRpcHostMessage(response));
+	}
+
+	private abortHostRequests(): void {
+		for (const controller of this.activeHostRequests.values()) controller.abort();
+		this.activeHostRequests.clear();
 	}
 
 	private createProcessExitError(code: number | null, signal: NodeJS.Signals | null): Error {
@@ -553,6 +727,9 @@ export class RpcClient {
 		}
 		if (this.exitError) {
 			throw this.exitError;
+		}
+		if (this.stopping) {
+			throw new Error("RPC client is stopping");
 		}
 		if (childProcess.exitCode !== null) {
 			const error = this.createProcessExitError(childProcess.exitCode, childProcess.signalCode);
