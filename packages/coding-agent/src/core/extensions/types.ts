@@ -22,6 +22,7 @@ import type {
 	ConstrainedSamplingConfig,
 	Context,
 	ImageContent,
+	JsonValue,
 	Model,
 	OAuthCredentials,
 	OAuthLoginCallbacks,
@@ -299,6 +300,16 @@ export interface CompactOptions {
 	customInstructions?: string;
 	onComplete?: (result: CompactionResult) => void;
 	onError?: (error: Error) => void;
+}
+
+export const EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR = "Extension host requests are unavailable in this mode.";
+
+/** Options for an RPC-only extension-to-host request. */
+export interface ExtensionHostRequestOptions {
+	/** Abort waiting locally. A late host response is ignored. */
+	signal?: AbortSignal;
+	/** Timeout in milliseconds. Defaults to 30 seconds and cannot exceed 120 seconds. */
+	timeout?: number;
 }
 
 /**
@@ -1361,6 +1372,16 @@ export interface ExtensionAPI {
 	// Actions
 	// =========================================================================
 
+	/**
+	 * Send a correlated request to the embedding host.
+	 * Only available while the extension is running in RPC mode.
+	 */
+	requestHost<TResponse extends JsonValue = JsonValue>(
+		service: string,
+		payload: JsonValue,
+		options?: ExtensionHostRequestOptions,
+	): Promise<TResponse>;
+
 	/** Send a custom message to the session. */
 	sendMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
@@ -1629,6 +1650,12 @@ export type SendUserMessageHandler = (
 
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
+export type ExtensionHostRequestHandler = (
+	service: string,
+	payload: JsonValue,
+	options?: ExtensionHostRequestOptions,
+) => Promise<JsonValue>;
+
 export type SetSessionNameHandler = (name: string) => void;
 
 export type GetSessionNameHandler = () => string | undefined;
@@ -1688,6 +1715,7 @@ export interface ExtensionRuntimeState {
  * Provided to runner.initialize(), copied into the shared runtime.
  */
 export interface ExtensionActions {
+	requestHost: ExtensionHostRequestHandler;
 	sendMessage: SendMessageHandler;
 	sendUserMessage: SendUserMessageHandler;
 	appendEntry: AppendEntryHandler;

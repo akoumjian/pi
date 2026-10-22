@@ -1050,7 +1050,7 @@ Control flow helpers. `ctx.isIdle()` is false while Pi is processing an agent ru
 Request a graceful shutdown of pi.
 
 - **Interactive mode:** Deferred until the agent becomes idle (after processing all queued steering and follow-up messages).
-- **RPC mode:** Deferred until the next idle state (after completing the current command response, when waiting for the next command).
+- **RPC mode:** Deferred until extension binding completes, all active command responses are written, and the agent is idle. A startup request exits without emitting `rpc_ready`.
 - **Print mode:** No-op. The process exits automatically when all prompts are processed.
 
 Emits `session_shutdown` event to all extensions before exiting. Available in all contexts (event handlers, tools, commands, shortcuts).
@@ -1357,6 +1357,24 @@ export default function (pi: ExtensionAPI) {
 ```
 
 ## ExtensionAPI Methods
+
+### pi.requestHost(service, payload, options?)
+
+Send a correlated, service-neutral request to the embedding host. This API is available only in RPC mode and rejects in interactive, JSON, and print modes. Call it from `session_start` or later, not from the extension factory, because the RPC transport is bound after extensions load.
+
+```typescript
+const result = await pi.requestHost<{ accepted: boolean }>(
+  "example.submit",
+  { value: 42 },
+  { timeout: 10_000, signal: ctx.signal },
+);
+```
+
+`service` must match `^[a-z][a-z0-9._-]{0,127}$`. The payload and response must be bounded JSON-compatible values (at most 64 levels and 65,536 visited values); shared acyclic references are accepted, while cycles, sparse arrays, accessors, symbol keys, exotic prototypes, proxies, non-finite numbers, and unsupported values are rejected. Requests default to a 30-second timeout; `timeout` is in milliseconds and can be at most 120 seconds. At most 16 requests may be pending, and each serialized protocol line is limited to 256 KiB. Aborting or timing out rejects locally; any later response is ignored.
+
+Outside an active RPC transport the promise rejects with `Extension host requests are unavailable in this mode.` A malformed response for a matched request rejects only that request. During explicit RPC client shutdown, active requests receive a bounded cancellation failure before stdin closes; child stdout EOF also closes the transport and rejects pending requests.
+
+The RPC host registers handlers through `RpcClient.hostRequestHandlers`. Pi does not assign meaning to service names or payloads. See [RPC Mode](rpc.md#extension-host-request-protocol) for the wire format and complete limits.
 
 ### pi.on(event, handler)
 

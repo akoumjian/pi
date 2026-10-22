@@ -17,11 +17,14 @@ Common options:
 - `--no-session`: Disable session persistence
 - `--session-dir <path>`: Custom session storage directory
 
+After starting Pi, clients must read stdout until they receive the exact `{"type":"rpc_ready"}` record before sending ordinary commands. During startup, only correlated extension host/UI responses are accepted; ordinary commands fail with `RPC session is not ready` and are not replayed. `RpcClient.start()` implements this handshake.
+
 ## Protocol Overview
 
 - **Commands**: JSON objects sent to stdin, one per line
 - **Responses**: JSON objects with `type: "response"` indicating command success/failure
 - **Events**: Agent events streamed to stdout as JSON lines
+- **Readiness**: Wait for the exact `{"type":"rpc_ready"}` record before sending ordinary commands
 
 All commands support an optional `id` field for request/response correlation. If provided, the corresponding response will include the same `id`. `bash_execution_update` events also include the `id` of their originating `bash` command.
 
@@ -1372,6 +1375,78 @@ Dismiss any dialog method. The extension receives `undefined` (for select/input/
 ```json
 {"type": "extension_ui_response", "id": "uuid-3", "cancelled": true}
 ```
+
+## RPC Lifecycle and Readiness
+
+RPC mode has four lifecycle states: `STARTING → READY → CLOSING → CLOSED`.
+
+During `STARTING`, Pi processes only correlated `extension_host_response` and `extension_ui_response` records needed by asynchronous extension `session_start` handlers. Every ordinary command received before readiness gets exactly one correlated failure with `RPC session is not ready`; it is never buffered or executed later. After rebind and all `session_start` handlers complete, Pi emits exactly one strict readiness record:
+
+```json
+{"type":"rpc_ready"}
+```
+
+`RpcClient.start()` waits for that exact record rather than sleeping for a fixed interval. Extension host requests continue to dispatch while it waits. Startup rejects if the process exits, stdout ends, the transport fails, or `stop()` begins before readiness.
+
+In `READY`, ordinary commands dispatch concurrently. This keeps state queries, abort commands, and reentrant host callbacks responsive while another command is long-running.
+
+EOF, explicit stop, signal, or RPC stdout/stderr channel loss transitions immediately to `CLOSING`, revokes host/UI requests, detaches input, discards unread work, and joins one idempotent runtime-disposal path. No ordinary command is admitted after closing begins, including commands received during startup. In-flight commands may be interrupted; callers that need completion must keep stdin open and wait for their correlated response. A broken RPC output channel suppresses further stdout/stderr writes and exits nonzero when it initiated closing. `session_shutdown` gets one cleanup opportunity, tracked detached children are terminated before exit, and a signal received during cleanup supplies the final signal exit status without starting a second cleanup.
+
+Extension `ctx.shutdown()` remains graceful rather than cancellation-first. During startup, Pi completes extension binding, emits no readiness record, and then shuts down. After readiness, Pi waits until every active RPC command has completed its response and the agent is idle, then joins the same cleanup path.
+
+## Extension Host Request Protocol
+
+RPC-mode extensions can make bounded, service-neutral requests to the embedding host with `pi.requestHost()`. This is separate from extension UI: it carries application data, has correlated success/failure responses, and is unavailable outside RPC mode.
+
+Extension to host (stdout):
+
+```json
+{"type":"extension_host_request","id":"550e8400-e29b-41d4-a716-446655440000","service":"example.lookup","payload":{"key":"value"}}
+```
+
+Host to extension (stdin), success:
+
+```json
+{"type":"extension_host_response","id":"550e8400-e29b-41d4-a716-446655440000","success":true,"data":{"found":true}}
+```
+
+Host to extension (stdin), failure:
+
+```json
+{"type":"extension_host_response","id":"550e8400-e29b-41d4-a716-446655440000","success":false,"error":"lookup failed"}
+```
+
+The request contract is intentionally narrow:
+
+- Service names must match `^[a-z][a-z0-9._-]{0,127}$`.
+- Correlation IDs are UUIDs and cannot exceed 128 bytes. Request and response envelopes are strict: required fields must be present, field types and literals must match exactly, and additional properties are rejected without coercion.
+- `payload` and successful response `data` must be bounded JSON-compatible values. Validation is iterative and limited to 64 levels and 65,536 visited values; cycles, sparse arrays, accessors, symbol keys, exotic prototypes, proxies, non-finite numbers, and unsupported JavaScript values are rejected.
+- Each serialized request or response line is limited to 256 KiB.
+- An RPC process can have at most 16 pending extension host requests.
+- Extension requests default to a 30-second timeout. A caller can select a positive integer timeout up to 120 seconds and can provide an `AbortSignal`.
+- Failure text is limited to 2 KiB.
+- Unknown and late responses do not affect another request. A duplicate active request ID is a protocol error: the original handler is aborted and retired, exactly one failure is emitted for that ID, and its later completion is suppressed.
+- A malformed matched response rejects only its corresponding extension promise. A deeply nested response cannot terminate the RPC input loop.
+- Pending requests are rejected when the RPC transport closes. Child stdout EOF is a terminal transport boundary even if the child has not emitted `exit` yet.
+- Shared acyclic object references are accepted and serialize as ordinary duplicated JSON values; actual cycles are rejected.
+
+`RpcClient` dispatches requests by exact service name:
+
+```typescript
+const client = new RpcClient({
+  hostRequestHandlers: {
+    "example.lookup": async (payload, { signal }) => {
+      signal.throwIfAborted();
+      const { key } = payload as { key: string };
+      return { found: key === "value" };
+    },
+  },
+});
+```
+
+Handler results must be JSON-compatible. Missing handlers, thrown errors, invalid results, oversized results, malformed requests, duplicate IDs, and request-limit failures become fixed, bounded categories. Raw handler exceptions, provider bodies, and other thrown text are never returned to the guest. Handler signals are aborted when the child process exits, stdout reaches EOF, or the client stops.
+
+`RpcClient.stop()` first rejects a pending readiness wait, revokes active handler authority, and writes bounded host-request cancellation failures while child stdin is still writable. It then closes stdin so Pi immediately enters `CLOSING`, runs the single `session_shutdown`/runtime-disposal path, and interrupts in-flight commands. If the child does not exit within five seconds, the client sends `SIGTERM`; after one more second it sends `SIGKILL`. TERM/KILL are client-side containment fallbacks only; the stop promise still waits for the actual child `exit` event after `SIGKILL`, and a child `error` event alone does not prove exit.
 
 ## Error Handling
 

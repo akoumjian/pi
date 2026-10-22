@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage, ThinkingLevel } from "@earendil-works/pi-agent-core";
-import type { ImageContent, Model } from "@earendil-works/pi-ai";
+import type { ImageContent, JsonValue, Model } from "@earendil-works/pi-ai";
 import type { SessionStats } from "../../core/agent-session.ts";
 import type { BashResult } from "../../core/bash-executor.ts";
 import type { CompactionResult } from "../../core/compaction/index.ts";
@@ -106,6 +106,15 @@ export interface RpcSessionState {
 	autoCompactionEnabled: boolean;
 	messageCount: number;
 	pendingMessageCount: number;
+}
+
+// ============================================================================
+// RPC Lifecycle (stdout)
+// ============================================================================
+
+/** Emitted exactly once after RPC session startup is complete and input is accepted. */
+export interface RpcReadyMessage {
+	type: "rpc_ready";
 }
 
 // ============================================================================
@@ -289,6 +298,23 @@ export type RpcExtensionUIResponse =
 	| { type: "extension_ui_response"; id: string; value: string }
 	| { type: "extension_ui_response"; id: string; confirmed: boolean }
 	| { type: "extension_ui_response"; id: string; cancelled: true };
+
+// ============================================================================
+// Extension Host Requests
+// ============================================================================
+
+/** Correlated request from an RPC-mode extension to its host. */
+export interface RpcExtensionHostRequest {
+	type: "extension_host_request";
+	id: string;
+	service: string;
+	payload: JsonValue;
+}
+
+/** Correlated host response to an RPC-mode extension request. */
+export type RpcExtensionHostResponse =
+	| { type: "extension_host_response"; id: string; success: true; data: JsonValue }
+	| { type: "extension_host_response"; id: string; success: false; error: string };
 
 // ============================================================================
 // Helper type for extracting command types

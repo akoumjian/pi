@@ -26,6 +26,7 @@ const rpcIo = vi.hoisted(() => ({
 
 vi.mock("../src/core/output-guard.js", () => ({
 	flushRawStdout: vi.fn(async () => {}),
+	registerRawOutputFailureHandler: vi.fn(() => () => {}),
 	takeOverStdout: vi.fn(),
 	waitForRawStdoutBackpressure: vi.fn(async () => {}),
 	writeRawStdout: (line: string) => {
@@ -180,6 +181,7 @@ async function startRpcMode(options: { withAuth: boolean; responseDelayMs: numbe
 	const { runtimeHost, cleanup } = await createRuntimeHost(options);
 	void runRpcMode(runtimeHost);
 	await vi.waitFor(() => expect(rpcIo.lineHandler).toBeDefined());
+	await vi.waitFor(() => expect(parseOutputLines(rpcIo.outputLines)).toContainEqual({ type: "rpc_ready" }));
 
 	return { lineHandler: rpcIo.lineHandler!, cleanup };
 }
@@ -291,9 +293,12 @@ describe("RPC prompt response semantics", () => {
 
 		try {
 			lineHandler(JSON.stringify({ id: "clear-start", type: "prompt", message: "Start" }));
-			await vi.waitFor(() => {
-				expect(getPromptResponses(rpcIo.outputLines, "clear-start")).toHaveLength(1);
-			});
+			await vi.waitFor(
+				() => {
+					expect(getPromptResponses(rpcIo.outputLines, "clear-start")).toHaveLength(1);
+				},
+				{ timeout: 5000 },
+			);
 
 			lineHandler(
 				JSON.stringify({

@@ -71,6 +71,8 @@ export type {
 	ExtensionFactory,
 	ExtensionFlag,
 	ExtensionHandler,
+	ExtensionHostRequestHandler,
+	ExtensionHostRequestOptions,
 	ExtensionMode,
 	// Runtime
 	ExtensionRuntime,
@@ -180,6 +182,7 @@ export type {
 // Type guards
 export {
 	defineTool,
+	EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR,
 	isBashToolResult,
 	isEditToolResult,
 	isFindToolResult,

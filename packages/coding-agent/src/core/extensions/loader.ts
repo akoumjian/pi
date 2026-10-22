@@ -45,6 +45,7 @@ import type {
 	RegisteredCommand,
 	ToolDefinition,
 } from "./types.ts";
+import { EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR } from "./types.ts";
 
 /** Modules available to extensions via virtualModules (for compiled binaries) */
 const VIRTUAL_MODULES: Record<string, unknown> = {
@@ -189,6 +190,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 	};
 
 	const runtime: ExtensionRuntime = {
+		requestHost: () => Promise.reject(new Error(EXTENSION_HOST_REQUEST_UNAVAILABLE_ERROR)),
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
 		appendEntry: notInitialized,
@@ -359,6 +361,11 @@ function createExtensionAPI(
 		},
 
 		// Action methods - delegate to shared runtime
+		requestHost(service, payload, options) {
+			assertActive();
+			return runtime.requestHost(service, payload, options);
+		},
+
 		sendMessage(message, options): void {
 			assertActive();
 			runtime.sendMessage(message, options);

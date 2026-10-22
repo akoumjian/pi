@@ -479,6 +479,7 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	let stdoutBuffer = "";
 	let stderr = "";
 	let readyElapsedMs;
+	let requestSent = false;
 	let responseError;
 	const requestId = `startup-benchmark-${runNumber}`;
 	const startedAt = performance.now();
@@ -494,6 +495,16 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 				parsed = JSON.parse(line);
 			} catch (error) {
 				responseError = error instanceof Error ? error.message : String(error);
+				return;
+			}
+
+			if (
+				parsed?.type === "rpc_ready" &&
+				Object.keys(parsed).length === 1 &&
+				!requestSent
+			) {
+				requestSent = true;
+				child.stdin.write(`${JSON.stringify({ id: requestId, type: "get_state" })}\n`);
 				return;
 			}
 
@@ -519,7 +530,6 @@ async function runRpcBenchmarkRun({ runtime, runIndex, measuredIndex, options, p
 	});
 
 	child.stdin.setDefaultEncoding("utf8");
-	child.stdin.write(`${JSON.stringify({ id: requestId, type: "get_state" })}\n`);
 
 	const exitCode = await waitForExit(child, `Benchmark ${measuredIndex === undefined ? `warmup ${runNumber}` : `run ${measuredIndex}`}`);
 
