@@ -72,7 +72,7 @@ export interface RpcModeOptions {
 }
 
 export async function runRpcMode(runtimeHost: AgentSessionRuntime, options: RpcModeOptions = {}): Promise<never> {
-	takeOverStdout();
+	takeOverStdout({ guardStderr: true });
 	const input = options.input ?? process.stdin;
 	const exit = options.exit ?? process.exit;
 	const signalSource = options.signalSource ?? process;

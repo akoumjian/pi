@@ -62,13 +62,71 @@ function writeProbeExtension(agentDirectory: string): void {
 	writeFileSync(
 		join(extensionDir, "rpc-lifecycle-probe.ts"),
 		`import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { EventStream } from "@earendil-works/pi-ai";
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 export default function (pi: any) {
+  let streamCalls = 0;
+  const model = {
+    id: "probe-model",
+    name: "Probe Model",
+    api: "probe-api",
+    provider: "probe",
+    baseUrl: "https://probe.invalid",
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 100000,
+    maxTokens: 4096,
+  };
+  const message = (text: string) => ({
+    role: "assistant",
+    content: [{ type: "text", text }],
+    api: "probe-api",
+    provider: "probe",
+    model: "probe-model",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+    stopReason: "stop",
+    timestamp: Date.now(),
+  });
+  const stream = (_model: any, _context: any, options: any) => {
+    streamCalls++;
+    const events = new EventStream(
+      (event: any) => event.type === "done" || event.type === "error",
+      (event: any) => event.type === "done" ? event.message : event.error,
+    );
+    const result = message("probe reply ".repeat(600));
+    const isCompaction = streamCalls >= 3 && !!process.env.COMPACTION_STREAM_MARKER;
+    if (isCompaction) appendFileSync(process.env.COMPACTION_STREAM_MARKER, "start\\n");
+    const timer = setTimeout(() => {
+      if (isCompaction) appendFileSync(process.env.COMPACTION_STREAM_MARKER, "complete\\n");
+      events.push({ type: "start", partial: message("") });
+      events.push({ type: "done", reason: "stop", message: result });
+    }, isCompaction ? 3000 : 10);
+    options?.signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      if (isCompaction) appendFileSync(process.env.COMPACTION_STREAM_MARKER, "abort\\n");
+      events.push({ type: "error", error: new Error("probe stream aborted") });
+    }, { once: true });
+    return events;
+  };
+  pi.registerProvider({
+    id: "probe",
+    name: "Probe",
+    baseUrl: "https://probe.invalid",
+    auth: { apiKey: { name: "Probe", resolve: async () => ({ auth: { apiKey: "probe-key" }, source: "probe" }) } },
+    getModels: () => [model],
+    stream,
+    streamSimple: stream,
+  });
   pi.on("session_start", async (_event: any, ctx: any) => {
     const marker = process.env.STARTUP_MARKER;
     if (marker) appendFileSync(marker, "start\\n");
     if (process.env.STARTUP_REQUEST_HOST === "1") {
       await pi.requestHost("startup.check", { version: 1 });
+    }
+    if (process.env.STARTUP_CONSOLE === "1") {
+      console.log("startup console.log probe");
+      console.error("startup console.error probe");
     }
     if (process.env.STARTUP_SHUTDOWN === "1") ctx.shutdown();
     await delay(Number(process.env.START_DELAY || 0));
@@ -186,6 +244,45 @@ describe.skipIf(process.platform === "win32" || !existsSync(builtCli))(
 			for (const pid of trackedPids) killProcessIfAlive(pid);
 			rmSync(root, { recursive: true, force: true });
 		});
+
+		it.each(["text", "json"] as const)(
+			"preserves the complete %s-mode result when the stderr reader closes",
+			async (mode) => {
+				const modeShutdownMarker = join(root, `${mode}-shutdown.log`);
+				let stdout = "";
+				const args = [builtCli];
+				if (mode === "json") args.push("--mode", "json");
+				args.push("--provider", "probe", "--model", "probe-model", "--no-session", "-p", "hello");
+				const child = spawn(process.execPath, args, {
+					cwd,
+					env: {
+						...process.env,
+						PI_CODING_AGENT_DIR: agentDir,
+						SHUTDOWN_MARKER: modeShutdownMarker,
+						STARTUP_CONSOLE: "1",
+					},
+					stdio: ["ignore", "pipe", "pipe"],
+				});
+				rawChild = child;
+				child.stdout!.on("data", (chunk) => {
+					stdout += chunk.toString();
+				});
+				child.stderr!.destroy();
+				const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+					child.once("exit", (code, signal) => resolve({ code, signal }));
+				});
+
+				await expect(withTimeout(exited, 10_000, `${mode} mode did not exit`)).resolves.toEqual({
+					code: 0,
+					signal: null,
+				});
+				rawChild = undefined;
+				expect(stdout).toContain("probe reply");
+				if (mode === "json") expect(stdout).toContain('"type":"agent_end"');
+				expect(readFileSync(modeShutdownMarker, "utf8")).toBe("start\ndone\n");
+			},
+			180_000,
+		);
 
 		it("waits for session_start host work before ready, then preserves concurrent bash control", async () => {
 			let callbackStateSeen = false;
@@ -548,23 +645,41 @@ child.on("exit", () => process.exit(0));
 			await vi.waitFor(() => expect(isProcessAlive(streamingPid)).toBe(false), { timeout: 5000, interval: 25 });
 		}, 180_000);
 
-		it("does not wait for fire-and-forget compaction after the command response", async () => {
+		it("shuts down naturally while fire-and-forget compaction is in flight", async () => {
 			const compactMarker = join(root, "compact.log");
+			const compactionStreamMarker = join(root, "compaction-stream.log");
+			writeFileSync(
+				join(agentDir, "settings.json"),
+				JSON.stringify({ compaction: { enabled: false, keepRecentTokens: 50 } }),
+			);
 			client = new RpcClient({
 				cliPath: builtCli,
 				cwd,
+				provider: "probe",
+				model: "probe-model",
 				env: {
 					PI_CODING_AGENT_DIR: agentDir,
 					COMPACT_MARKER: compactMarker,
+					COMPACTION_STREAM_MARKER: compactionStreamMarker,
 					SHUTDOWN_MARKER: shutdownMarker,
 				},
 			});
 			await client.start();
+			await client.promptAndWait(`first ${"alpha ".repeat(800)}`);
+			await client.promptAndWait(`second ${"beta ".repeat(800)}`);
+			const child = (client as unknown as { process: ChildProcess }).process;
+			const exited = new Promise<void>((resolve) => {
+				if (child.exitCode !== null || child.signalCode !== null) resolve();
+				else child.once("exit", () => resolve());
+			});
 
 			await withTimeout(client.prompt("/compact-shutdown-probe"), 10_000, "compact shutdown response was lost");
-			await withTimeout(client.stop(), 10_000, "compact shutdown did not exit");
+			await withTimeout(exited, 5000, "ctx.shutdown waited for compaction or required client.stop()");
 			client = undefined;
 			expect(readFileSync(compactMarker, "utf8")).toContain("start\nrequested\n");
+			expect(readFileSync(compactMarker, "utf8")).toContain("error\n");
+			expect(readFileSync(compactMarker, "utf8")).not.toContain("complete\n");
+			expect(readFileSync(compactionStreamMarker, "utf8")).toBe("start\nabort\n");
 			expect(readFileSync(shutdownMarker, "utf8")).toBe("start\ndone\n");
 		}, 180_000);
 	},

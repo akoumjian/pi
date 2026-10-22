@@ -1,8 +1,20 @@
+type RawWrite = (
+	chunk: string | Uint8Array,
+	encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
+	callback?: (error?: Error | null) => void,
+) => boolean;
+
 interface StdoutTakeoverState {
-	rawStdoutWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
-	rawStderrWrite: (chunk: string, callback?: (error?: Error | null) => void) => boolean;
+	rawStdoutWrite: RawWrite;
+	rawStderrWrite: RawWrite;
 	originalStdoutWrite: typeof process.stdout.write;
 	originalStderrWrite: typeof process.stderr.write;
+	stderrGuarded: boolean;
+}
+
+export interface StdoutTakeoverOptions {
+	/** Treat redirected/direct stderr failure as fatal. Reserved for RPC transport containment. */
+	guardStderr?: boolean;
 }
 
 type RawOutputFailureHandler = (error: Error) => void;
@@ -15,11 +27,11 @@ const RAW_STDOUT_RETRY_DELAY_MS = 10;
 
 let rawStdoutWriteTail: Promise<void> = Promise.resolve();
 
-function getRawStdoutWrite(): StdoutTakeoverState["rawStdoutWrite"] {
+function getRawStdoutWrite(): RawWrite {
 	if (stdoutTakeoverState) {
 		return stdoutTakeoverState.rawStdoutWrite;
 	}
-	return process.stdout.write.bind(process.stdout) as StdoutTakeoverState["rawStdoutWrite"];
+	return process.stdout.write.bind(process.stdout) as RawWrite;
 }
 
 function normalizeError(error: unknown): Error {
@@ -34,6 +46,42 @@ function reportRawOutputFailure(error: unknown): void {
 		return;
 	}
 	process.exit(1);
+}
+
+function enableGuardedStderr(state: StdoutTakeoverState): void {
+	if (state.stderrGuarded) return;
+
+	const guardedStderrWrite: RawWrite = (chunk, encodingOrCallback, callback) => {
+		const writeCallback = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
+		let callbackQueued = false;
+		const completeWrite = () => {
+			if (callbackQueued || !writeCallback) return;
+			callbackQueued = true;
+			queueMicrotask(() => writeCallback(null));
+		};
+		if (rawOutputFailure) {
+			completeWrite();
+			return true;
+		}
+		try {
+			const onWrite = (error?: Error | null) => {
+				if (error) reportRawOutputFailure(error);
+				completeWrite();
+			};
+			if (typeof encodingOrCallback === "string") {
+				return state.rawStderrWrite(chunk, encodingOrCallback, onWrite);
+			}
+			return state.rawStderrWrite(chunk, onWrite);
+		} catch (error) {
+			reportRawOutputFailure(error);
+			completeWrite();
+			return true;
+		}
+	};
+
+	process.stdout.write = guardedStderrWrite as typeof process.stdout.write;
+	process.stderr.write = guardedStderrWrite as typeof process.stderr.write;
+	state.stderrGuarded = true;
 }
 
 async function writeRawStdoutChunk(text: string): Promise<void> {
@@ -62,55 +110,41 @@ async function writeRawStdoutChunk(text: string): Promise<void> {
 	}
 }
 
-export function takeOverStdout(): void {
+export function takeOverStdout(options: StdoutTakeoverOptions = {}): void {
 	if (stdoutTakeoverState) {
+		if (options.guardStderr) enableGuardedStderr(stdoutTakeoverState);
 		return;
 	}
 
-	const rawStdoutWrite = process.stdout.write.bind(process.stdout) as StdoutTakeoverState["rawStdoutWrite"];
-	const rawStderrWrite = process.stderr.write.bind(process.stderr) as StdoutTakeoverState["rawStderrWrite"];
+	const rawStdoutWrite = process.stdout.write.bind(process.stdout) as RawWrite;
+	const rawStderrWrite = process.stderr.write.bind(process.stderr) as RawWrite;
 	const originalStdoutWrite = process.stdout.write;
 	const originalStderrWrite = process.stderr.write;
 
-	const guardedStderrWrite = (
-		chunk: string | Uint8Array,
-		encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
-		callback?: (error?: Error | null) => void,
-	): boolean => {
-		const writeCallback = typeof encodingOrCallback === "function" ? encodingOrCallback : callback;
-		if (rawOutputFailure) {
-			writeCallback?.();
-			return true;
+	process.stdout.write = ((chunk, encodingOrCallback, callback): boolean => {
+		if (typeof encodingOrCallback === "function") {
+			return rawStderrWrite(String(chunk), encodingOrCallback);
 		}
-		try {
-			return rawStderrWrite(String(chunk), (error) => {
-				if (error) reportRawOutputFailure(error);
-				writeCallback?.();
-			});
-		} catch (error) {
-			reportRawOutputFailure(error);
-			writeCallback?.();
-			return true;
-		}
-	};
-
-	process.stdout.write = guardedStderrWrite as typeof process.stdout.write;
-	process.stderr.write = guardedStderrWrite as typeof process.stderr.write;
+		return rawStderrWrite(String(chunk), callback);
+	}) as typeof process.stdout.write;
 
 	stdoutTakeoverState = {
 		rawStdoutWrite,
 		rawStderrWrite,
 		originalStdoutWrite,
 		originalStderrWrite,
+		stderrGuarded: false,
 	};
+	if (options.guardStderr) enableGuardedStderr(stdoutTakeoverState);
 }
+
 export function restoreStdout(): void {
 	if (!stdoutTakeoverState) {
 		return;
 	}
 
 	process.stdout.write = stdoutTakeoverState.originalStdoutWrite;
-	process.stderr.write = stdoutTakeoverState.originalStderrWrite;
+	if (stdoutTakeoverState.stderrGuarded) process.stderr.write = stdoutTakeoverState.originalStderrWrite;
 	stdoutTakeoverState = undefined;
 }
 
@@ -118,7 +152,7 @@ export function isStdoutTakenOver(): boolean {
 	return stdoutTakeoverState !== undefined;
 }
 
-/** Register mode-specific cleanup for fatal raw stdout or redirected stderr failure. */
+/** Register mode-specific cleanup for fatal raw output failure or stream closure. */
 export function registerRawOutputFailureHandler(handler: RawOutputFailureHandler): () => void {
 	rawOutputFailureHandler = handler;
 	const stdout = process.stdout;
