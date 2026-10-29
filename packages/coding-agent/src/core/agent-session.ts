@@ -1168,6 +1168,13 @@ export class AgentSession {
 	// =========================================================================
 
 	private async _runAgentPrompt(messages: AgentMessage | AgentMessage[]): Promise<void> {
+		// Triggered custom-message runs bypass before_agent_start. If the preceding
+		// local run left an extension-modified prompt in Agent state, keep that exact
+		// prompt through this tool loop instead of reverting after its first tool call.
+		// Normal prompted runs already set _systemPromptOverride explicitly.
+		if (this._systemPromptOverride === undefined && this.agent.state.systemPrompt !== this._baseSystemPrompt) {
+			this._systemPromptOverride = this.agent.state.systemPrompt;
+		}
 		if (this.agent.state.messages.length > 0) {
 			await this._compactBeforeNextAssistantResponse({
 				systemPrompt: this.agent.state.systemPrompt,

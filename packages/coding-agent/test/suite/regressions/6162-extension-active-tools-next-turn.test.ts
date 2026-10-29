@@ -189,4 +189,58 @@ describe("extension active tools next-turn refresh", () => {
 			harness.cleanup();
 		}
 	});
+
+	it("keeps an extension-modified prompt stable through a triggered custom-message tool loop", async () => {
+		const extensionFactories: ExtensionFactory[] = [
+			(pi) => {
+				pi.on("before_agent_start", async (event) => ({
+					systemPrompt: `${event.systemPrompt}\n\nkeep extension override`,
+				}));
+
+				pi.registerTool({
+					name: "probe",
+					label: "Probe",
+					description: "Return a deterministic probe result",
+					parameters: Type.Object({}),
+					execute: async () => ({
+						content: [{ type: "text", text: "probe complete" }],
+						details: {},
+					}),
+				});
+			},
+		];
+		const harness = await createHarness({ extensionFactories });
+
+		try {
+			harness.session.setActiveToolsByName(["probe"]);
+
+			const providerSystemPrompts: string[] = [];
+			harness.setResponses([
+				(context) => {
+					providerSystemPrompts.push(context.systemPrompt ?? "");
+					return fauxAssistantMessage("initial done");
+				},
+				(context) => {
+					providerSystemPrompts.push(context.systemPrompt ?? "");
+					return fauxAssistantMessage(fauxToolCall("probe", {}), { stopReason: "toolUse" });
+				},
+				(context) => {
+					providerSystemPrompts.push(context.systemPrompt ?? "");
+					return fauxAssistantMessage("custom done");
+				},
+			]);
+
+			await harness.session.prompt("start");
+			await harness.session.sendCustomMessage(
+				{ customType: "async-completion", content: "job done", display: true, details: {} },
+				{ triggerTurn: true },
+			);
+
+			expect(providerSystemPrompts).toHaveLength(3);
+			expect(providerSystemPrompts.every((prompt) => prompt.includes("keep extension override"))).toBe(true);
+			expect(providerSystemPrompts[2]).toBe(providerSystemPrompts[1]);
+		} finally {
+			harness.cleanup();
+		}
+	});
 });
